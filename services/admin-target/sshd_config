@@ -1,0 +1,66 @@
+# =============================================================================
+# OSTRAL — lot D — sshd durci d'admin-target (Z3)
+#   E06 / F15 : SSH direct interdit — seul le bastion (guacd, 10.10.3.11) peut ouvrir une session
+#               d'administration ; aucun mot de passe, aucun root.
+#   F16       : le serveur de sauvegarde (10.10.3.41) se connecte avec un compte dédié en
+#               lecture seule, commande forcée.
+# =============================================================================
+Port 22
+ListenAddress 0.0.0.0
+AddressFamily inet
+
+HostKey /etc/ssh/ostral/hostkeys/ssh_host_ed25519_key
+PidFile /run/sshd.pid
+
+# Journalisation vers syslog (rsyslog -> /var/log/admin-target/auth.log, volume logs_admin_target).
+# VERBOSE : empreinte de la clé utilisée à chaque connexion (traçabilité E06 / SIEM E08).
+SyslogFacility AUTH
+LogLevel VERBOSE
+
+# --- Authentification : clé uniquement --------------------------------------
+PermitRootLogin no
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+AuthenticationMethods publickey
+# (openssh d'Alpine est compilé sans PAM : pas de directive UsePAM)
+# Clés autorisées gérées par root (générées au démarrage), non modifiables par les utilisateurs.
+AuthorizedKeysFile /run/ostral-authkeys/%u
+StrictModes yes
+MaxAuthTries 3
+LoginGraceTime 30
+MaxSessions 2
+MaxStartups 10:30:60
+
+# Comptes ET adresses sources autorisés (défense en profondeur, en plus de from= dans les clés)
+AllowUsers ostral-admin@10.10.3.11 backup-ro@10.10.3.41
+
+# --- Algorithmes (compatibles libssh2 de guacd) ------------------------------
+HostKeyAlgorithms ssh-ed25519
+PubkeyAcceptedAlgorithms ssh-ed25519,rsa-sha2-512,rsa-sha2-256
+KexAlgorithms sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes128-ctr
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
+
+# --- Pas de rebond ni de tunnel ----------------------------------------------
+AllowTcpForwarding no
+AllowStreamLocalForwarding no
+AllowAgentForwarding no
+GatewayPorts no
+PermitTunnel no
+X11Forwarding no
+PermitUserEnvironment no
+PermitUserRC no
+UseDNS no
+PrintMotd no
+PrintLastLog no
+ClientAliveInterval 300
+ClientAliveCountMax 2
+Banner /etc/ssh/banner.txt
+# Pas de sous-système SFTP : les transferts passent par la sauvegarde (F16) uniquement.
+
+# --- Compte de sauvegarde : commande forcée lecture seule (F16) --------------
+Match User backup-ro
+    ForceCommand /usr/local/bin/backup-ro.sh
+    PermitTTY no

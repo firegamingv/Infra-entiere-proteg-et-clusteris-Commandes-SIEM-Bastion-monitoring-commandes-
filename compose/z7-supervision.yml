@@ -1,0 +1,493 @@
+# OSTRAL — Lot E : zone Z7 supervision, SIEM et sauvegarde (voir SPEC.md, dossier p. 10-14)
+#
+# - Wazuh single-node 4.14.4 (profil `siem`, ~4,5 Go RAM) : manager + indexer + dashboard
+#   + one-shots (certificats internes, comptes locaux, politique de rétention ISM).
+#   Le SIEM utilise des COMPTES LOCAUX (base interne de l'indexer + API Wazuh), indépendants
+#   de l'annuaire AD : un attaquant qui prend l'AD ne peut pas effacer ses traces (E08, p. 12).
+# - Uptime Kuma : disponibilité (E11, F18), sonde « Internet » sur z0_internet.
+# - backup : sauvegarde en mode pull (F16, E09), restic chiffré, copie hors site (F17).
+# - minio-offsite : stockage objet « second fournisseur » avec verrouillage (Object Lock).
+#
+# Les réseaux sont déclarés dans docker-compose.yml (non redéclarés ici).
+# Les volumes logs_* sont partagés avec les autres lots (déclarations fusionnées).
+
+x-hardening: &hardening
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Wazuh — one-shot 1 : certificats internes (TLS indexer / manager / dashboard)
+  # Image officielle wazuh-certs-generator (comme wazuh-docker/single-node).
+  # Idempotent : ne régénère rien si ./services/wazuh/certs/root-ca.pem existe.
+  # Télécharge wazuh-certs-tool.sh depuis packages.wazuh.com : utilise donc le réseau
+  # `default` (créé par compose, avec sortie), uniquement pour ce one-shot.
+  # ---------------------------------------------------------------------------
+  wazuh-certs:
+    image: wazuh/wazuh-certs-generator:0.0.4
+    profiles: ["siem"]
+    hostname: wazuh-certs-generator
+    entrypoint: ["/bin/bash", "/ostral/certs-once.sh"]
+    environment:
+      - CERT_TOOL_VERSION=4.14
+    volumes:
+      - ./services/wazuh/certs/:/certificates/
+      - ./services/wazuh/config/certs.yml:/config/certs.yml:ro
+      - ./services/wazuh/scripts/certs-once.sh:/ostral/certs-once.sh:ro
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    mem_limit: 256m
+    cpus: 0.5
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Wazuh — one-shot 2 : comptes LOCAUX du SIEM (E08 : indépendants de l'AD)
+  # Génère internal_users.yml (hash bcrypt via l'outil hash.sh de l'image indexer)
+  # et wazuh.yml (connexion dashboard -> API) à partir des variables .env.
+  # Aucun réseau (network_mode none) : rien ne sort.
+  # ---------------------------------------------------------------------------
+  wazuh-users-init:
+    image: wazuh/wazuh-indexer:4.14.4
+    profiles: ["siem"]
+    user: "0:0"   # écrit dans un dossier de l'hôte puis donne les fichiers à l'UID 1000
+    network_mode: none
+    entrypoint: ["/bin/bash", "/ostral/init-users.sh"]
+    environment:
+      - INDEXER_PASSWORD=${INDEXER_PASSWORD:?INDEXER_PASSWORD obligatoire}
+      - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:?DASHBOARD_PASSWORD obligatoire}
+      - API_USERNAME=wazuh-wui
+      - API_PASSWORD=${API_PASSWORD:?API_PASSWORD obligatoire}
+      - JAVA_HOME=/usr/share/wazuh-indexer/jdk
+      - OPENSEARCH_JAVA_HOME=/usr/share/wazuh-indexer/jdk
+    volumes:
+      - ./services/wazuh/scripts/init-users.sh:/ostral/init-users.sh:ro
+      - ./services/wazuh/config/wazuh_indexer/internal_users.yml.tpl:/ostral/internal_users.yml.tpl:ro
+      - ./services/wazuh/generated/:/ostral/generated/
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    mem_limit: 512m
+    cpus: 1
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Wazuh indexer (OpenSearch) — Z7, 10.10.7.21:9200, jamais publié sur l'hôte.
+  # ulimits : memlock illimité et nofile 65536 exigés par OpenSearch (doc Wazuh).
+  # Pré-requis hôte : vm.max_map_count >= 262144 (sysctl non namespacé, voir README).
+  # Image non-root (UID 1000) : cap_drop ALL possible.
+  # ---------------------------------------------------------------------------
+  wazuh-indexer:
+    <<: *hardening
+    image: wazuh/wazuh-indexer:4.14.4
+    profiles: ["siem"]
+    hostname: wazuh-indexer
+    depends_on:
+      wazuh-certs:
+        condition: service_completed_successfully
+      wazuh-users-init:
+        condition: service_completed_successfully
+    environment:
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    cap_drop: [ALL]
+    mem_limit: 2g
+    cpus: 2
+    volumes:
+      - wazuh_indexer_data:/var/lib/wazuh-indexer
+      - ./services/wazuh/certs/root-ca.pem:/usr/share/wazuh-indexer/config/certs/root-ca.pem:ro
+      - ./services/wazuh/certs/wazuh-indexer-key.pem:/usr/share/wazuh-indexer/config/certs/wazuh.indexer.key:ro
+      - ./services/wazuh/certs/wazuh-indexer.pem:/usr/share/wazuh-indexer/config/certs/wazuh.indexer.pem:ro
+      - ./services/wazuh/certs/admin.pem:/usr/share/wazuh-indexer/config/certs/admin.pem:ro
+      - ./services/wazuh/certs/admin-key.pem:/usr/share/wazuh-indexer/config/certs/admin-key.pem:ro
+      - ./services/wazuh/config/wazuh_indexer/wazuh.indexer.yml:/usr/share/wazuh-indexer/config/opensearch.yml:ro
+      - ./services/wazuh/generated/internal_users.yml:/usr/share/wazuh-indexer/config/opensearch-security/internal_users.yml:ro
+    networks:
+      z7_supervision:
+        ipv4_address: 10.10.7.21
+    healthcheck:
+      # 401 attendu sans identifiants : on teste seulement que l'API TLS répond
+      test: ["CMD-SHELL", "curl -sk -o /dev/null https://127.0.0.1:9200/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  # ---------------------------------------------------------------------------
+  # Wazuh manager — Z7, 10.10.7.20. Ports 1514 (agents) / 1515 (enrôlement) ouverts
+  # dans Z7 uniquement (F11), 55000 (API) pour le dashboard. Rien n'est publié sur l'hôte.
+  # Lit en LECTURE SEULE les volumes de journaux des autres zones (équivalent maquette
+  # des agents, F11) sous /var/log/ostral/<service>/.
+  # Image s6-overlay démarrée en root puis daemons sous l'utilisateur wazuh (UID/GID 999) :
+  # cap_drop ALL + capacités minimales (chroot des daemons OSSEC, changement d'UID,
+  # lecture des journaux appartenant à d'autres UID par wazuh-logcollector).
+  # ---------------------------------------------------------------------------
+  wazuh-manager:
+    <<: *hardening
+    image: wazuh/wazuh-manager:4.14.4
+    profiles: ["siem"]
+    hostname: wazuh-manager
+    depends_on:
+      wazuh-certs:
+        condition: service_completed_successfully
+      wazuh-indexer:
+        condition: service_healthy
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 655360, hard: 655360 }
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, SETGID, SETUID, SYS_CHROOT]
+    mem_limit: 1536m
+    cpus: 2
+    environment:
+      - TZ=Europe/Paris   # règles « hors horaires » évaluées à l'heure de Paris
+      - INDEXER_URL=https://10.10.7.21:9200
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=${INDEXER_PASSWORD:?INDEXER_PASSWORD obligatoire}
+      - FILEBEAT_SSL_VERIFICATION_MODE=full
+      - SSL_CERTIFICATE_AUTHORITIES=/etc/ssl/root-ca.pem
+      - SSL_CERTIFICATE=/etc/ssl/filebeat.pem
+      - SSL_KEY=/etc/ssl/filebeat.key
+      - API_USERNAME=wazuh-wui
+      - API_PASSWORD=${API_PASSWORD:?API_PASSWORD obligatoire}
+    expose: ["1514", "1515", "55000"]
+    volumes:
+      - wazuh_api_configuration:/var/ossec/api/configuration
+      - wazuh_etc:/var/ossec/etc
+      - wazuh_logs:/var/ossec/logs            # contient logs/archives (logall_json, E08)
+      - wazuh_queue:/var/ossec/queue
+      - wazuh_var_multigroups:/var/ossec/var/multigroups
+      - wazuh_integrations:/var/ossec/integrations
+      - wazuh_active_response:/var/ossec/active-response/bin
+      - wazuh_agentless:/var/ossec/agentless
+      - wazuh_wodles:/var/ossec/wodles
+      - wazuh_filebeat_etc:/etc/filebeat
+      - wazuh_filebeat_var:/var/lib/filebeat
+      - ./services/wazuh/certs/root-ca-manager.pem:/etc/ssl/root-ca.pem:ro
+      - ./services/wazuh/certs/wazuh-manager.pem:/etc/ssl/filebeat.pem:ro
+      - ./services/wazuh/certs/wazuh-manager-key.pem:/etc/ssl/filebeat.key:ro
+      # Configuration OSTRAL (copiée dans /var/ossec par l'entrypoint de l'image)
+      - ./services/wazuh/config/wazuh_manager/ossec.conf:/wazuh-config-mount/etc/ossec.conf:ro
+      - ./services/wazuh/config/wazuh_manager/local_rules.xml:/wazuh-config-mount/etc/rules/local_rules.xml:ro
+      - ./services/wazuh/config/wazuh_manager/local_decoder.xml:/wazuh-config-mount/etc/decoders/local_decoder.xml:ro
+      # Journaux des zones Z1-Z7, en lecture seule (E08, F11)
+      - logs_waf:/var/log/ostral/waf:ro
+      - logs_boutique:/var/log/ostral/boutique:ro
+      - logs_odoo:/var/log/ostral/odoo:ro
+      - logs_erp_db:/var/log/ostral/erp-db:ro
+      - logs_samba:/var/log/ostral/samba:ro
+      - logs_guacamole:/var/log/ostral/guacamole:ro
+      - logs_admin_target:/var/log/ostral/admin-target:ro
+      - logs_backup:/var/log/ostral/backup:ro
+      - logs_wireguard:/var/log/ostral/wireguard:ro
+    networks:
+      z7_supervision:
+        ipv4_address: 10.10.7.20
+    healthcheck:
+      test: ["CMD-SHELL", "/var/ossec/bin/wazuh-control status | grep -q 'wazuh-analysisd is running' && /var/ossec/bin/wazuh-control status | grep -q 'wazuh-logcollector is running'"]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 180s
+
+  # ---------------------------------------------------------------------------
+  # Wazuh dashboard — Z7, 10.10.7.22:5601 (HTTPS). PAS publié sur l'hôte :
+  # accès d'administration via le VPN WireGuard (10.10.7.5) uniquement (F09).
+  # Démo locale : ajouter services/wazuh/compose.dashboard-demo.yml à COMPOSE_FILE
+  # (publie 127.0.0.1:5601). Image non-root (UID 1000).
+  # ---------------------------------------------------------------------------
+  wazuh-dashboard:
+    <<: *hardening
+    image: wazuh/wazuh-dashboard:4.14.4
+    profiles: ["siem"]
+    hostname: wazuh-dashboard
+    depends_on:
+      wazuh-indexer:
+        condition: service_healthy
+      wazuh-manager:
+        condition: service_started
+    cap_drop: [ALL]
+    mem_limit: 1g
+    cpus: 1
+    environment:
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=${INDEXER_PASSWORD:?INDEXER_PASSWORD obligatoire}
+      - WAZUH_API_URL=https://10.10.7.20
+      - DASHBOARD_USERNAME=kibanaserver
+      - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:?DASHBOARD_PASSWORD obligatoire}
+      - API_USERNAME=wazuh-wui
+      - API_PASSWORD=${API_PASSWORD:?API_PASSWORD obligatoire}
+    expose: ["5601"]
+    volumes:
+      - ./services/wazuh/certs/wazuh-dashboard.pem:/usr/share/wazuh-dashboard/certs/wazuh-dashboard.pem:ro
+      - ./services/wazuh/certs/wazuh-dashboard-key.pem:/usr/share/wazuh-dashboard/certs/wazuh-dashboard-key.pem:ro
+      - ./services/wazuh/certs/root-ca.pem:/usr/share/wazuh-dashboard/certs/root-ca.pem:ro
+      - ./services/wazuh/config/wazuh_dashboard/opensearch_dashboards.yml:/usr/share/wazuh-dashboard/config/opensearch_dashboards.yml:ro
+      - ./services/wazuh/generated/wazuh.yml:/usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml
+      - wazuh_dashboard_config:/usr/share/wazuh-dashboard/data/wazuh/config
+      - wazuh_dashboard_custom:/usr/share/wazuh-dashboard/plugins/wazuh/public/assets/custom
+    networks:
+      z7_supervision:
+        ipv4_address: 10.10.7.22
+    healthcheck:
+      # L'image n'embarque pas curl : on utilise le node fourni avec le dashboard
+      test: ["CMD", "/usr/share/wazuh-dashboard/node/bin/node", "-e", "require('https').get({host:'127.0.0.1',port:5601,path:'/',rejectUnauthorized:false},r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+
+  # ---------------------------------------------------------------------------
+  # Wazuh — one-shot 3 : politique ISM « 90 jours consultables » (E08)
+  # Rejouable sans risque (création ou mise à jour de la politique).
+  # ---------------------------------------------------------------------------
+  wazuh-ism-init:
+    image: curlimages/curl:8.22.0
+    profiles: ["siem"]
+    depends_on:
+      wazuh-indexer:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/ostral/apply-ism.sh"]
+    environment:
+      - INDEXER_URL=https://10.10.7.21:9200
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=${INDEXER_PASSWORD:?INDEXER_PASSWORD obligatoire}
+      - ISM_POLICY_FILE=/ostral/ostral-retention-90j.json
+    volumes:
+      - ./services/wazuh/scripts/apply-ism.sh:/ostral/apply-ism.sh:ro
+      - ./services/wazuh/ism/ostral-retention-90j.json:/ostral/ostral-retention-90j.json:ro
+      - ./services/wazuh/certs/root-ca.pem:/ostral/root-ca.pem:ro
+    user: "100:101"
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 64m
+    cpus: 0.25
+    networks:
+      z7_supervision:
+        ipv4_address: 10.10.7.25
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Uptime Kuma — disponibilité (E11, F18). Z7 + « Internet » (sonde externe) + Z3.
+  # L'entrypoint de l'image fait chown de /app/data puis setpriv vers PUID/PGID (1000) :
+  # d'où CHOWN/SETUID/SETGID/DAC_OVERRIDE ; l'application tourne ensuite non-root.
+  # Interface 3001 non publiée sur l'hôte : accès via VPN (10.10.7.30:3001).
+  # ---------------------------------------------------------------------------
+  uptime-kuma:
+    <<: *hardening
+    image: louislam/uptime-kuma:1.23.17
+    hostname: uptime-kuma
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Paris
+      # AC interne OSTRAL (lot B) : vérification TLS de https://ostral.local sans « ignorer TLS »
+      - NODE_EXTRA_CA_CERTS=/run/certs/ca.crt
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE]
+    sysctls:
+      # sondes ping sans setuid ni CAP_NET_RAW (compatible no-new-privileges)
+      net.ipv4.ping_group_range: "0 2147483647"
+    mem_limit: 384m
+    cpus: 0.5
+    # La sonde « Internet » résout ostral.local vers l'adresse publique du WAF (Z0)
+    extra_hosts:
+      - "ostral.local:10.10.0.10"
+    volumes:
+      - uptime_kuma_data:/app/data
+      - ./certs/ca.crt:/run/certs/ca.crt:ro
+    expose: ["3001"]
+    networks:
+      z7_supervision:
+        ipv4_address: 10.10.7.30
+      z0_internet:
+        ipv4_address: 10.10.0.30
+      z3_servers:
+        ipv4_address: 10.10.3.40
+      # F18 : contrôle de disponibilité du bastion (Guacamole 10.10.6.10:8080)
+      z6_admin:
+        ipv4_address: 10.10.6.30
+    healthcheck:
+      test: ["CMD", "extra/healthcheck"]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 180s
+
+  # ---------------------------------------------------------------------------
+  # backup — serveur de sauvegarde Z7, mode PULL (F16, E09), 3-2-1-1-0 (p. 11).
+  #  - pg_dump horaire de erp-db (rôle backup_ro, lecture seule) via z4_data ;
+  #  - tar de /srv/data sur admin-target par SSH (clé dédiée) via z3_servers ;
+  #  - filestore Odoo (volume odoo_data en lecture seule : écart documenté ci-dessous) ;
+  #  - dépôt restic chiffré local (backup_repo) + copie vers minio-offsite (F17) ;
+  #  - copie nocturne des archives Wazuh (E08) si le profil siem a tourné.
+  # Non-root (UID 10001), racine en lecture seule, aucune capacité.
+  # ---------------------------------------------------------------------------
+  backup:
+    <<: *hardening
+    build:
+      context: ./services/backup
+    image: ostral/backup:1.0.0
+    hostname: backup
+    user: "10001:10001"
+    # GID 999 = groupe wazuh du manager : lecture des archives (logs/archives en 750)
+    group_add: ["999"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    mem_limit: 768m
+    cpus: 1
+    environment:
+      - TZ=Europe/Paris
+      - RESTIC_REPOSITORY=/repo
+      - RESTIC_PASSWORD=${RESTIC_PASSWORD:?RESTIC_PASSWORD obligatoire}
+      - RESTIC_CACHE_DIR=/var/lib/backup/scratch/restic-cache
+      - ERP_DB_HOST=erp-db
+      - ERP_DB_PORT=5432
+      - ERP_DB_NAME=${ERP_DB_NAME:-ostral}
+      - ERP_DB_BACKUP_USER=${ERP_DB_BACKUP_USER:-backup_ro}
+      # même variable que le lot C (création du rôle backup_ro)
+      - ERP_DB_BACKUP_PASSWORD=${ERP_DB_BACKUP_PASSWORD:?ERP_DB_BACKUP_PASSWORD obligatoire}
+      - BACKUP_SSH_HOST=10.10.3.30
+      - BACKUP_SSH_USER=${BACKUP_SSH_USER:-backup-ro}
+      - BACKUP_SSH_PATH=/srv/data
+      - BACKUP_SSH_COMMAND=export   # commande forcée backup-ro.sh (lot D) : tar de /srv/data
+      - OFFSITE_ENDPOINT=http://minio-offsite:9000
+      - OFFSITE_BUCKET=${MINIO_OFFSITE_BUCKET:-ostral-backup-offsite}
+      - MINIO_BACKUP_ACCESS_KEY=${MINIO_BACKUP_ACCESS_KEY:?MINIO_BACKUP_ACCESS_KEY obligatoire}
+      - MINIO_BACKUP_SECRET_KEY=${MINIO_BACKUP_SECRET_KEY:?MINIO_BACKUP_SECRET_KEY obligatoire}
+      - UPTIME_KUMA_PUSH_HOURLY=${UPTIME_KUMA_PUSH_HOURLY:-}
+      - UPTIME_KUMA_PUSH_NIGHTLY=${UPTIME_KUMA_PUSH_NIGHTLY:-}
+      - RESTORE_MIN_TABLES=${RESTORE_MIN_TABLES:-50}
+    volumes:
+      - backup_repo:/repo                      # 2e copie, 1er support (disques Z7)
+      - backup_ssh:/var/lib/backup/ssh         # clé privée générée au 1er démarrage
+      - backup_scratch:/var/lib/backup/scratch # cache restic + PostgreSQL de test de restauration
+      - logs_backup:/var/log/backup            # journal JSON lu par Wazuh (E08)
+      - wazuh_logs:/mnt/wazuh-logs:ro          # archives Wazuh (vide si le profil siem n'a jamais tourné)
+      # ÉCART au mode pull SSH (F16), documenté : le filestore Odoo (pièces jointes, hors base)
+      # est dans le volume odoo_data du lot C ; en maquette, il est monté en LECTURE SEULE ici
+      # (équivalent d'un export NFS en lecture seule). En cible : pull SSH/rsync en lecture seule
+      # depuis le serveur ERP, comme pour admin-target.
+      - odoo_data:/mnt/odoo-data:ro
+    networks:
+      z7_supervision:
+        ipv4_address: 10.10.7.40
+      z4_data:
+        ipv4_address: 10.10.4.40
+      z3_servers:
+        ipv4_address: 10.10.3.41
+      z7_offsite:
+        ipv4_address: 10.10.17.40
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -x supercronic >/dev/null && test -f /repo/config"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # minio-offsite — stockage objet « second fournisseur européen » (Z0 logique, F17).
+  # Uniquement sur z7_offsite : seul le serveur de sauvegarde le joint.
+  # Image Bitnami (legacy, figée) : les images minio/minio ne sont plus publiées sur
+  # Docker Hub. Non-root (UID 1001).
+  # ---------------------------------------------------------------------------
+  minio-offsite:
+    <<: *hardening
+    image: bitnamilegacy/minio:2025.7.23-debian-12-r5
+    hostname: minio-offsite
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:?MINIO_ROOT_USER obligatoire}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD obligatoire}
+      - MINIO_DATA_DIR=/bitnami/minio/data
+      - MINIO_BROWSER=off           # pas de console web : administration par mc uniquement
+      - MINIO_SKIP_CLIENT=yes
+    cap_drop: [ALL]
+    mem_limit: 512m
+    cpus: 1
+    volumes:
+      - minio_offsite_data:/bitnami/minio/data
+    expose: ["9000"]
+    networks:
+      z7_offsite:
+        ipv4_address: 10.10.17.50
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /minio/health/live HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && head -n1 <&3 | grep -q ' 200 '"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # One-shot : bucket verrouillé (Object Lock COMPLIANCE 30 j) + compte écriture seule.
+  minio-offsite-init:
+    image: bitnamilegacy/minio-client:2025.7.21-debian-12-r3
+    depends_on:
+      minio-offsite:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/ostral/init-offsite.sh"]
+    environment:
+      - HOME=/tmp
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:?MINIO_ROOT_USER obligatoire}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD obligatoire}
+      - MINIO_BACKUP_ACCESS_KEY=${MINIO_BACKUP_ACCESS_KEY:?MINIO_BACKUP_ACCESS_KEY obligatoire}
+      - MINIO_BACKUP_SECRET_KEY=${MINIO_BACKUP_SECRET_KEY:?MINIO_BACKUP_SECRET_KEY obligatoire}
+      - OFFSITE_BUCKET=${MINIO_OFFSITE_BUCKET:-ostral-backup-offsite}
+      - OFFSITE_RETENTION_MODE=${MINIO_OFFSITE_RETENTION_MODE:-COMPLIANCE}
+      - OFFSITE_RETENTION_DAYS=${MINIO_OFFSITE_RETENTION_DAYS:-30}
+    volumes:
+      - ./services/minio-offsite/init-offsite.sh:/ostral/init-offsite.sh:ro
+      - ./services/minio-offsite/policy-backup-writeonly.json:/ostral/policy-backup-writeonly.json:ro
+    user: "1001:1001"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 128m
+    cpus: 0.25
+    networks:
+      z7_offsite:
+        ipv4_address: 10.10.17.51
+    restart: "no"
+
+volumes:
+  # Journaux partagés (déclarations identiques fusionnées avec les autres lots)
+  logs_waf:
+  logs_boutique:
+  logs_odoo:
+  logs_erp_db:
+  logs_samba:
+  logs_guacamole:
+  logs_admin_target:
+  logs_backup:
+  logs_wireguard:
+  # Wazuh
+  wazuh_api_configuration:
+  wazuh_etc:
+  wazuh_logs:
+  wazuh_queue:
+  wazuh_var_multigroups:
+  wazuh_integrations:
+  wazuh_active_response:
+  wazuh_agentless:
+  wazuh_wodles:
+  wazuh_filebeat_etc:
+  wazuh_filebeat_var:
+  wazuh_indexer_data:
+  wazuh_dashboard_config:
+  wazuh_dashboard_custom:
+  # Supervision et sauvegarde
+  uptime_kuma_data:
+  backup_repo:
+  backup_ssh:
+  backup_scratch:
+  minio_offsite_data:
+  # Filestore Odoo (déclaré par le lot C, lu en lecture seule par backup)
+  odoo_data:

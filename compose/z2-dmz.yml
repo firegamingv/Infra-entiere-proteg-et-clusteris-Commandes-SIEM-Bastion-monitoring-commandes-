@@ -1,0 +1,151 @@
+# =============================================================================
+# OSTRAL — Lot B : Z2 DMZ — WAF / reverse proxy (nginx + ModSecurity v3 + OWASP CRS 4)
+# Fragment fusionné via COMPOSE_FILE (chemins relatifs à la racine du projet).
+# Réseaux déclarés dans docker-compose.yml (référencés ici sans redéclaration).
+#
+# Flux portés (matrice du dossier) :
+#   F01  Internet (Z0) -> WAF 443/TLS (publié 443:8443) : seul point d'entrée du site (E04)
+#   F02  WAF -> boutique:3000 (z1_cloud), TLS terminé au WAF, tout est inspecté avant
+#   F04  boutique -> WAF 10.10.1.10:9443 en mTLS (certificat client CN=boutique)
+#   F05  WAF -> odoo:8069 (z3_api, réseau dédié), routes d'API Odoo en POST uniquement
+#   F14  DMZ -> zones internes : bloqué. Le WAF n'est attaché qu'aux réseaux nécessaires :
+#        côté Z3 uniquement z3_api (WAF + odoo), pas z3_servers (admin-target…).
+#        Aucune route vers Z4/Z5/Z6/Z7/Z8.
+# Prérequis : scripts/gen-certs.sh (PKI dans ./certs).
+# Pas de depends_on vers boutique/odoo : amonts résolus dynamiquement (DNS 127.0.0.11).
+# =============================================================================
+
+services:
+  waf:
+    # Image dérivée de owasp/modsecurity-crs:4.30.0-nginx-alpine-202610180210 (tag daté,
+    # immuable, E12) : n'ajoute que les templates de configuration OSTRAL.
+    build:
+      context: ./services/waf
+    image: ostral/waf:4.30.0-nginx-alpine-202610180210
+    hostname: waf
+    restart: unless-stopped
+
+    networks:
+      z0_internet:
+        ipv4_address: 10.10.0.10
+      z2_dmz:
+        ipv4_address: 10.10.2.10
+      z1_cloud:
+        ipv4_address: 10.10.1.10
+        # F04 : la boutique peut joindre l'API ERP par son nom TLS (SNI) sans fichier hosts
+        aliases:
+          - erp-api.ostral.internal
+      # F05 : réseau dédié WAF <-> Odoo (pas z3_servers : F14, le WAF ne doit pas
+      # pouvoir joindre les autres serveurs internes, ex. admin-target:22)
+      z3_api:
+        ipv4_address: 10.10.13.10
+
+    # F01 : seul HTTPS sert du contenu. Le port 80 ne fait qu'une redirection 301 vers
+    # https://ostral.local (puis HSTS). Le 9443 (F04) n'est PAS publié sur l'hôte.
+    ports:
+      - "${WAF_HTTPS_PORT:-443}:8443"
+      - "${WAF_HTTP_PORT:-80}:8080"
+
+    environment:
+      TZ: Europe/Paris
+      # --- OWASP CRS : mode blocage, anomaly scoring ---------------------------------
+      # Paranoïa 1 par défaut (peu de faux positifs pour une boutique) ; 2 possible
+      # (WAF_PARANOIA=2) après une phase d'observation des journaux d'audit.
+      BLOCKING_PARANOIA: ${WAF_PARANOIA:-1}
+      ANOMALY_INBOUND: ${WAF_ANOMALY_INBOUND:-5}
+      ANOMALY_OUTBOUND: ${WAF_ANOMALY_OUTBOUND:-4}
+      ALLOWED_METHODS: ${WAF_ALLOWED_METHODS:-GET HEAD POST OPTIONS}
+      # --- ModSecurity v3 -------------------------------------------------------------
+      MODSEC_RULE_ENGINE: "on"
+      MODSEC_REQ_BODY_ACCESS: "on"
+      MODSEC_REQ_BODY_LIMIT: "1048576"
+      MODSEC_REQ_BODY_NOFILES_LIMIT: "131072"
+      MODSEC_RESP_BODY_ACCESS: "on"
+      # Audit log JSON, uniquement les transactions pertinentes (4xx hors 404, 5xx).
+      # Parties A,B,F,H,Z : en-têtes et verdict, SANS les corps (I/E) => pas de mots de
+      # passe ni de données personnelles des formulaires dans les journaux (RGPD, E03).
+      MODSEC_AUDIT_ENGINE: RelevantOnly
+      MODSEC_AUDIT_LOG: /var/log/nginx/modsec_audit.json
+      MODSEC_AUDIT_LOG_FORMAT: JSON
+      MODSEC_AUDIT_LOG_TYPE: Serial
+      MODSEC_AUDIT_LOG_PARTS: ABFHZ
+      # --- nginx (templates OSTRAL) ---------------------------------------------------
+      NGINX_WORKER_PROCESSES: "2"
+      WORKER_CONNECTIONS: "1024"
+      CLIENT_BODY_TIMEOUT: 10s
+      LOGLEVEL: warn
+      # E04 / SS2 / SS4 : limitation de débit (réponse 429)
+      WAF_AUTH_RATE: ${WAF_AUTH_RATE:-10r/m}
+      WAF_AUTH_BURST: ${WAF_AUTH_BURST:-5}
+      WAF_GLOBAL_RATE: ${WAF_GLOBAL_RATE:-20r/s}
+      WAF_GLOBAL_BURST: ${WAF_GLOBAL_BURST:-40}
+      WAF_CONN_PER_IP: ${WAF_CONN_PER_IP:-30}
+      WAF_MAX_BODY_SIZE: ${WAF_MAX_BODY_SIZE:-1m}
+      WAF_HSTS_MAX_AGE: ${WAF_HSTS_MAX_AGE:-31536000}
+
+    volumes:
+      # PKI (E03, F04), en lecture seule. Montage fichier par fichier plutôt que ./certs
+      # entier : ca.key (clé de l'AC) et la clé client de la boutique ne doivent jamais
+      # se trouver dans la DMZ. Chemins identiques au contrat (/etc/nginx/certs/...).
+      # create_host_path: false => erreur explicite si gen-certs.sh n'a pas été lancé.
+      - type: bind
+        source: ./certs/ca.crt
+        target: /etc/nginx/certs/ca.crt
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ./certs/waf-public.crt
+        target: /etc/nginx/certs/waf-public.crt
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ./certs/waf-public.key
+        target: /etc/nginx/certs/waf-public.key
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ./certs/waf-erp-api.crt
+        target: /etc/nginx/certs/waf-erp-api.crt
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ./certs/waf-erp-api.key
+        target: /etc/nginx/certs/waf-erp-api.key
+        read_only: true
+        bind: { create_host_path: false }
+      # Journaux (E08) : waf_access.json, waf_error.log, modsec_audit.json -> SIEM
+      - logs_waf:/var/log/nginx
+
+    # --- Durcissement (E12) ---------------------------------------------------------
+    user: "101:101"                # utilisateur « nginx » de l'image (non-root)
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL                        # ports > 1024 : aucune capacité nécessaire
+    # read_only: NON. L'image publiée (variante « writable » ; les variantes read-only ne
+    # sont pas publiées sur Docker Hub) génère sa configuration AU DÉMARRAGE : envsubst
+    # des templates vers /etc/nginx, recopie dans /etc/modsecurity.d, édition de
+    # /opt/owasp-crs/crs-setup.conf selon BLOCKING_PARANOIA… Un tmpfs sur ces répertoires
+    # masquerait les fichiers de l'image. Compensations : non-root, no-new-privileges,
+    # cap_drop ALL, aucune donnée persistée hors volume de journaux, image reconstruite
+    # à l'identique depuis la configuration versionnée (RTO 1 h, aucune donnée en DMZ).
+    read_only: false
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 256
+    healthcheck:
+      # /healthz n'est servi qu'à 127.0.0.1 et pour le SNI ostral.local (-f : échec si != 2xx)
+      test: ["CMD-SHELL", "curl -fsk --max-time 4 --resolve ostral.local:8443:127.0.0.1 https://ostral.local:8443/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  # Journaux du WAF, montés en lecture seule dans wazuh-manager par le lot E (E08, F11)
+  logs_waf:

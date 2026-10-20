@@ -1,0 +1,4 @@
+*****************************************************************************
+  OSTRAL - Systeme d'information prive. Acces reserve aux personnes autorisees.
+  Les sessions sont enregistrees par le bastion et journalisees (E06).
+*****************************************************************************

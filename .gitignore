@@ -1,0 +1,11 @@
+# Secrets (E12 : secrets hors des images et hors du dépôt)
+.env
+certs/
+*.key
+*.pem
+services/wireguard/config/
+node_modules/
+reports/
+vpn-clients/
+# Fichiers d environnement par lot (peuvent contenir de vrais secrets) : modeles dans .env.example
+env/*.env

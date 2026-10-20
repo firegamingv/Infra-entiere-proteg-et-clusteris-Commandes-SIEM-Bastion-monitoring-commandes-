@@ -1,0 +1,20 @@
+{
+  "name": "ostral-boutique",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OSTRAL - boutique en ligne (Z1) : catalogue, comptes clients, paiement délégué au PSP (E02), file d'attente vers l'ERP (R2)",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "bcryptjs": "2.4.3",
+    "express": "4.21.2",
+    "helmet": "8.0.0",
+    "pg": "8.13.1"
+  }
+}

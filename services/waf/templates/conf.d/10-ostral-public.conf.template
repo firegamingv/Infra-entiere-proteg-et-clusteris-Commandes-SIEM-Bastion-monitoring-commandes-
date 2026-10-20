@@ -1,0 +1,87 @@
+# =============================================================================
+# OSTRAL — Lot B : vhost public de la boutique (F01 -> F02)
+#   Internet (Z0) --TLS 443--> WAF (Z2, conteneur :8443) --HTTP--> boutique:3000 (Z1)
+# ModSecurity v3 + OWASP CRS 4 actifs (mode blocage, anomaly scoring, paranoïa
+# BLOCKING_PARANOIA, cf. compose/z2-dmz.yml) ; limitation de débit (E04, SS2, SS4).
+# =============================================================================
+
+# F01 — port 80 (publié 80:8080) : redirection permanente vers HTTPS uniquement, aucun
+# contenu servi en clair. Cible fixe (pas $host) : pas de redirection ouverte.
+server {
+    listen 8080 default_server;
+    server_name _;
+    modsecurity off;
+    location / {
+        return 301 https://ostral.local$request_uri;
+    }
+}
+
+# Tout nom TLS inconnu (SNI absent ou différent de ostral.local) : poignée de main refusée,
+# le certificat n'est même pas présenté (réduit la découverte / le scan par IP).
+server {
+    listen 8443 ssl default_server;
+    server_name _;
+    ssl_reject_handshake on;
+}
+
+# F01 — ostral.local en HTTPS
+server {
+    listen 8443 ssl;
+    http2 on;
+    server_name ostral.local;
+
+    ssl_certificate     /etc/nginx/certs/waf-public.crt;
+    ssl_certificate_key /etc/nginx/certs/waf-public.key;
+    include includes/ostral-tls.conf;
+
+    # Corrélation access log <-> audit log ModSecurity <-> journaux boutique (X-Request-ID)
+    modsecurity_transaction_id "$request_id";
+
+    # En-têtes de sécurité (remplacent ceux éventuellement posés par la boutique).
+    # HSTS (E03) : le navigateur n'utilisera plus que HTTPS pour ostral.local.
+    more_set_headers "Strict-Transport-Security: max-age=${WAF_HSTS_MAX_AGE}; includeSubDomains";
+    more_set_headers "X-Content-Type-Options: nosniff";
+    more_set_headers "X-Frame-Options: DENY";
+    more_set_headers "Referrer-Policy: strict-origin-when-cross-origin";
+
+    # SS4 / E04 : limites globales par IP source (réponse 429 au-delà)
+    limit_conn ostral_conn ${WAF_CONN_PER_IP};
+    limit_req zone=ostral_global burst=${WAF_GLOBAL_BURST} nodelay;
+
+    # F02 : amont boutique (résolu dynamiquement par le DNS Docker 127.0.0.11)
+    set $ostral_boutique http://boutique:3000;
+
+    # Sonde de vie locale (healthcheck compose) : hors ModSecurity et hors journal ;
+    # réservée à 127.0.0.1 (le test est fait en phase rewrite, avant « return »).
+    location = /healthz {
+        modsecurity off;
+        access_log off;
+        if ($remote_addr != "127.0.0.1") {
+            return 404;
+        }
+        default_type text/plain;
+        return 200 "OK\n";
+    }
+
+    # F03 / E02 : la notification de paiement du PSP arrive directement à la boutique
+    # par z1_egress, JAMAIS via le WAF => interdite depuis Internet (pas de fausse
+    # notification « paiement accepté » forgée par un client).
+    location ^~ /payment/notify {
+        return 403;
+    }
+
+    # E04 / SS2 : authentification et création de compte (bourrage d'identifiants),
+    # routes de la boutique POST /login et POST /register. Seuls les POST sont comptés
+    # (cf. map $ostral_auth_key) : au-delà de WAF_AUTH_RATE (+ rafale WAF_AUTH_BURST)
+    # par IP => 429. Cumulé avec la limite globale.
+    location ~ ^/(?:login|register)/?$ {
+        limit_req zone=ostral_auth   burst=${WAF_AUTH_BURST} nodelay;
+        limit_req zone=ostral_global burst=${WAF_GLOBAL_BURST} nodelay;
+        include includes/ostral-proxy-boutique.conf;
+    }
+
+    # F02 : tout le reste du site, inspecté par ModSecurity/CRS avant la boutique
+    location / {
+        include includes/ostral-proxy-boutique.conf;
+    }
+}

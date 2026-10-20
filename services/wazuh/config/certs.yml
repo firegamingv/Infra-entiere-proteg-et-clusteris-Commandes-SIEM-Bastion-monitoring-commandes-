@@ -1,0 +1,21 @@
+# OSTRAL — inventaire des nœuds Wazuh pour wazuh-certs-generator (comme wazuh-docker/single-node).
+# Les noms = noms des services compose (résolution DNS interne de Z7). Les certificats
+# produits (services/wazuh/certs/) portent ces noms en CN/SAN :
+#   wazuh-indexer.pem, wazuh-manager.pem, wazuh-dashboard.pem, admin.pem, root-ca.pem
+# Les certificats portent l'IP fixe en SAN : les clients (manager, dashboard, ISM) utilisent donc
+# les IP 10.10.7.20/.21 et non les noms d'hôte.
+# L'outil n'accepte qu'une IP ou un FQDN (avec point) : les certificats portent l'IP fixe en SAN,
+# donc les clients (manager, dashboard, ISM) joignent 10.10.7.20 / .21 et non les noms d'hôte.
+nodes:
+  # Wazuh indexer (10.10.7.21)
+  indexer:
+    - name: wazuh-indexer
+      ip: 10.10.7.21     # l'outil exige une IP ou un FQDN ; le nom reste en CN/SAN DNS
+  # Wazuh server / manager (10.10.7.20)
+  server:
+    - name: wazuh-manager
+      ip: 10.10.7.20
+  # Wazuh dashboard (10.10.7.22)
+  dashboard:
+    - name: wazuh-dashboard
+      ip: 10.10.7.22

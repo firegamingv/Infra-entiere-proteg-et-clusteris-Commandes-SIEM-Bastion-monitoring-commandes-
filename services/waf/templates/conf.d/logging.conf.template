@@ -1,0 +1,8 @@
+# OSTRAL — Lot B : journaux d'accès (E08), remplace logging.conf de l'image.
+# Format ostral_json défini dans nginx.conf (une ligne JSON par requête, statuts 403/429,
+# IP client, request_id). Le fichier est sur le volume logs_waf, lu par Wazuh (F11) ;
+# copie sur stdout pour « docker compose logs waf ».
+# NB : les noms waf_*.json / waf_*.log évitent access.log / error.log, qui sont dans
+# l'image des liens vers /dev/stdout et /dev/stderr (recopiés dans le volume).
+access_log /var/log/nginx/waf_access.json ostral_json;
+access_log /dev/stdout ostral_json;

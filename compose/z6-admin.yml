@@ -1,0 +1,409 @@
+# =============================================================================
+# OSTRAL — lot D — Z6 administration : VPN WireGuard (FW1), bastion Guacamole (MFA + sessions
+# enregistrées) et serveur cible admin-target (Z3).
+#
+# Exigences : E06 (administration uniquement par le bastion, MFA, sessions enregistrées,
+# SSH direct interdit), E07 (comptes prestataires nominatifs et temporaires), F09 (VPN puis
+# bastion / console SIEM, RESTREINT), F10 (bastion -> serveurs TCP 22), F16 (pull de sauvegarde
+# en lecture seule), R3 / SS5 (vol de compte admin, abus de droits).
+#
+# Chemins relatifs à la RACINE du projet (fragments fusionnés via COMPOSE_FILE, voir SPEC.md).
+# Réseaux déclarés dans docker-compose.yml (non redéclarés ici).
+#
+# Ordre de démarrage :
+#   guac-init (one-shot : clés SSH, droits des volumes)
+#     -> guac-initdb (one-shot : schéma SQL officiel généré par l'image guacamole)
+#       -> guac-db (charge schéma + comptes OSTRAL au premier démarrage)
+#         -> guacd, guacamole ; admin-target ; wireguard
+#
+# Exposition : SEUL le port 51820/udp (WireGuard) est publié sur l'hôte. Le bastion n'est
+# joignable qu'à travers le tunnel (F09). Pour une démonstration sans VPN, profil `demo`
+# (service bastion-demo, 127.0.0.1:8080 uniquement) — désactivé par défaut, voir plus bas.
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # One-shot : génération des clés SSH (bastion -> admin-target, clé d'hôte épinglée) et
+  # préparation des droits des volumes partagés. Sans réseau. Réutilise l'image admin-target
+  # (ssh-keygen). Idempotent.
+  # ---------------------------------------------------------------------------
+  guac-init:
+    build: ./services/admin-target
+    image: ostral/admin-target:1.0.0
+    network_mode: none
+    user: "0:0"
+    entrypoint: ["/bin/sh", "/opt/ostral/guac-init.sh"]
+    environment:
+      GUAC_SSH_KEY_TYPE: ${GUAC_SSH_KEY_TYPE:-ed25519}
+    volumes:
+      - ./services/guacamole/init/guac-init.sh:/opt/ostral/guac-init.sh:ro
+      - guac_sshkey:/out/guac-sshkey
+      - admin_target_ssh:/out/admin-target-ssh
+      - guac_recordings:/out/recordings
+      - logs_guacamole:/out/logs-guacamole
+      - guac_initdb_sql:/out/initdb-sql
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE]
+    mem_limit: 64m
+    cpus: 0.25
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # One-shot : génère le schéma PostgreSQL officiel de Guacamole (initdb.sh fourni par l'image)
+  # dans le volume guac_initdb_sql, chargé ensuite par guac-db. Sans réseau. Idempotent.
+  # ---------------------------------------------------------------------------
+  guac-initdb:
+    image: guacamole/guacamole:1.6.0
+    network_mode: none
+    depends_on:
+      guac-init:
+        condition: service_completed_successfully
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        if [ -s /out/001-schema.sql ]; then echo 'schéma déjà généré';
+        else /opt/guacamole/bin/initdb.sh --postgresql > /out/001-schema.sql.tmp
+        && mv /out/001-schema.sql.tmp /out/001-schema.sql && echo 'schéma généré'; fi
+    volumes:
+      - guac_initdb_sql:/out
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 256m
+    cpus: 0.5
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Base interne du bastion (z6_data, joignable uniquement par guacamole).
+  # Au premier démarrage : schéma + comptes nominatifs + connexion SSH enregistrée
+  # (services/guacamole/initdb/010-ostral-guacamole.sh et sql/020-ostral-comptes.sql).
+  # ---------------------------------------------------------------------------
+  guac-db:
+    image: postgres:16.15-alpine3.24
+    hostname: guac-db
+    depends_on:
+      guac-init:
+        condition: service_completed_successfully
+      guac-initdb:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_DB: guacamole_db
+      POSTGRES_USER: guacamole_user
+      POSTGRES_PASSWORD: ${GUAC_DB_PASSWORD:?GUAC_DB_PASSWORD requis (env/d-admin.env.example)}
+      # Mots de passe INITIAUX des comptes nominatifs (à changer dans Paramètres > Préférences au 1er login,
+      # puis enrôlement TOTP). Lus uniquement lors de l'initialisation de la base.
+      GUAC_ADMIN_PASSWORD: ${GUAC_ADMIN_PASSWORD:?GUAC_ADMIN_PASSWORD requis (compte admin1)}
+      GUAC_ADMIN2_PASSWORD: ${GUAC_ADMIN2_PASSWORD:?GUAC_ADMIN2_PASSWORD requis (compte admin2)}
+      GUAC_AGENCE_WEB_PASSWORD: ${GUAC_AGENCE_WEB_PASSWORD:?GUAC_AGENCE_WEB_PASSWORD requis (compte agence-web)}
+      # E07 : compte prestataire limité dans le temps (date de fin, max 90 jours) et en horaires.
+      AGENCE_WEB_VALID_UNTIL: ${AGENCE_WEB_VALID_UNTIL:?AGENCE_WEB_VALID_UNTIL requis (AAAA-MM-JJ)}
+      AGENCE_WEB_ACCESS_START: ${AGENCE_WEB_ACCESS_START:-08:00}
+      AGENCE_WEB_ACCESS_END: ${AGENCE_WEB_ACCESS_END:-19:00}
+      OSTRAL_TZ: ${OSTRAL_TZ:-Europe/Paris}
+    volumes:
+      - guac_db_data:/var/lib/postgresql/data
+      - guac_initdb_sql:/opt/ostral/initdb-gen:ro
+      - guac_sshkey:/opt/ostral/sshkey:ro
+      - ./services/guacamole/sql:/opt/ostral/sql:ro
+      - ./services/guacamole/initdb:/docker-entrypoint-initdb.d:ro
+    networks:
+      z6_data:
+        ipv4_address: 10.10.16.20
+    read_only: true
+    tmpfs:
+      - /var/run/postgresql:size=4m
+      - /tmp:size=32m
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    # Entrypoint postgres : démarre en root, prépare les répertoires puis bascule en "postgres".
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]
+    healthcheck:
+      # TCP (et non socket) : faux positif impossible pendant l'initialisation (serveur temporaire
+      # sans écoute TCP).
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U guacamole_user -d guacamole_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    mem_limit: 256m
+    cpus: 0.5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # guacd : proxy de protocoles du bastion. C'est LUI qui ouvre les sessions SSH vers les
+  # serveurs (F10) ; il est donc attaché aux zones administrées (IP du SPEC).
+  # Écoute UNIQUEMENT sur 10.10.6.11 (z6_admin) : depuis Z2/Z3/Z4/Z5/Z7, le port 4822 n'est pas
+  # joignable (sinon n'importe quel conteneur de ces zones pourrait l'utiliser comme rebond, F14).
+  # Les enregistrements de sessions sont écrits dans guac_recordings (E06).
+  # ---------------------------------------------------------------------------
+  guacd:
+    image: guacamole/guacd:1.6.0
+    depends_on:
+      guac-init:
+        condition: service_completed_successfully
+    # Arguments ajoutés après ceux de l'entrypoint de l'image (-b 0.0.0.0) : le dernier -b gagne.
+    command: ["-b", "10.10.6.11", "-l", "4822"]
+    environment:
+      LOG_LEVEL: info
+    volumes:
+      - guac_recordings:/var/lib/guacamole/recordings
+    networks:
+      z6_admin:
+        ipv4_address: 10.10.6.11
+      z3_servers:
+        ipv4_address: 10.10.3.11
+      z4_data:
+        ipv4_address: 10.10.4.11
+      z5_identity:
+        ipv4_address: 10.10.5.11
+      z7_supervision:
+        ipv4_address: 10.10.7.11
+      z2_dmz:
+        ipv4_address: 10.10.2.11
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 10.10.6.11 4822 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    mem_limit: 512m
+    cpus: 1.0
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Bastion Guacamole (application web, Tomcat, utilisateur non-root UID 1001).
+  #   - authentification base PostgreSQL + TOTP obligatoire (E06, R3) ;
+  #   - historique et relecture des sessions enregistrées (E06, SS5) ;
+  #   - politique de mots de passe et anti-force brute (BAN, actif par défaut dans l'image) ;
+  #   - journaux fichier dans logs_guacamole (E08).
+  # NON publié sur l'hôte : accessible uniquement via le VPN (F09).
+  # ---------------------------------------------------------------------------
+  guacamole:
+    image: guacamole/guacamole:1.6.0
+    depends_on:
+      guac-db:
+        condition: service_healthy
+      guacd:
+        condition: service_healthy
+    environment:
+      WEBAPP_CONTEXT: ROOT                       # bastion servi sur http://10.10.6.10:8080/
+      GUACAMOLE_HOME: /opt/ostral/guacamole-home # modèle : logback.xml (journal fichier)
+      GUACD_HOSTNAME: 10.10.6.11
+      GUACD_PORT: "4822"
+      # --- Authentification base de données -------------------------------------------
+      POSTGRESQL_ENABLED: "true"
+      POSTGRESQL_HOSTNAME: guac-db
+      POSTGRESQL_PORT: "5432"
+      POSTGRESQL_DATABASE: guacamole_db
+      POSTGRESQL_USERNAME: guacamole_user
+      POSTGRESQL_PASSWORD: ${GUAC_DB_PASSWORD:?GUAC_DB_PASSWORD requis}
+      POSTGRESQL_AUTO_CREATE_ACCOUNTS: "false"
+      # Politique de mots de passe (E06, R3)
+      POSTGRESQL_USER_PASSWORD_MIN_LENGTH: "12"
+      POSTGRESQL_USER_PASSWORD_REQUIRE_MULTIPLE_CASE: "true"
+      POSTGRESQL_USER_PASSWORD_REQUIRE_DIGIT: "true"
+      POSTGRESQL_USER_PASSWORD_REQUIRE_SYMBOL: "true"
+      POSTGRESQL_USER_PASSWORD_PROHIBIT_USERNAME: "true"
+      POSTGRESQL_USER_PASSWORD_MAX_AGE: "90"
+      POSTGRESQL_USER_PASSWORD_HISTORY_SIZE: "5"
+      # Une session ouverte est coupée à la fin de la fenêtre horaire du prestataire (E07).
+      POSTGRESQL_ENFORCE_ACCESS_WINDOWS_FOR_ACTIVE_SESSIONS: "true"
+      # --- MFA TOTP : enrôlement imposé au premier login (E06, R3) ----------------------
+      TOTP_ENABLED: "true"
+      TOTP_ISSUER: "OSTRAL Bastion"
+      # --- Enregistrement des sessions : consultation dans l'historique (E06, SS5) ------
+      RECORDING_ENABLED: "true"
+      RECORDING_SEARCH_PATH: /var/lib/guacamole/recordings
+      # --- Anti force brute (déjà actif par défaut dans l'image 1.6.0) ------------------
+      # NB : les clients VPN arrivent tous via la NAT de wireguard (10.10.6.5) ; un bannissement
+      # concerne donc l'ensemble du VPN pendant BAN_ADDRESS_DURATION (compromis documenté).
+      BAN_ENABLED: "true"
+      BAN_MAX_INVALID_ATTEMPTS: "5"
+      BAN_ADDRESS_DURATION: "300"
+    volumes:
+      - ./services/guacamole/home:/opt/ostral/guacamole-home:ro
+      - guac_recordings:/var/lib/guacamole/recordings:ro
+      - logs_guacamole:/var/log/guacamole
+    networks:
+      z6_admin:
+        ipv4_address: 10.10.6.10
+      z6_data:
+        ipv4_address: 10.10.16.10
+    # L'image 1.6.0 génère GUACAMOLE_HOME et CATALINA_BASE sous /tmp : racine en lecture seule.
+    read_only: true
+    tmpfs:
+      - /tmp:size=384m
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/8080' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    mem_limit: 768m
+    cpus: 1.0
+    restart: unless-stopped
+    # Option de démonstration NON retenue ici : z6_admin/z6_data sont des réseaux "internal",
+    # Docker n'y publie AUCUN port (un `ports: ["127.0.0.1:8080:8080"]` serait sans effet).
+    # Utiliser le profil `demo` (service bastion-demo ci-dessous) si le VPN est indisponible.
+
+  # ---------------------------------------------------------------------------
+  # VPN WireGuard — point d'entrée des administrateurs et du prestataire (F09), rôle FW1.
+  # Image linuxserver/wireguard (tag fixé) + scripts OSTRAL copiés (services/wireguard) :
+  #   - pairs nominatifs : admin1, admin2, agenceweb (= compte bastion "agence-web" ; l'image
+  #     n'accepte que des noms alphanumériques) ;
+  #   - iptables : admins -> bastion 8080, Wazuh 5601/443, Uptime Kuma 3001 ;
+  #     prestataire -> bastion 8080 SEULEMENT ; tout le reste LOG + DROP ;
+  #   - journal des connexions/refus -> logs_wireguard.
+  # Module noyau : WireGuard est intégré aux noyaux >= 5.6 (dont WSL2 / Docker Desktop),
+  # donc SYS_MODULE et le montage de /lib/modules sont volontairement omis.
+  # Pas de read_only : l'image s6/linuxserver réécrit /etc et /config au démarrage.
+  # ---------------------------------------------------------------------------
+  wireguard:
+    build: ./services/wireguard
+    image: ostral/wireguard:1.0.20260223-r0-ls126
+    hostname: vpn-ostral
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: ${OSTRAL_TZ:-Europe/Paris}
+      SERVERURL: ${WG_SERVERURL:?WG_SERVERURL requis (adresse publique ou IP de l'hôte)}
+      SERVERPORT: "51820"
+      PEERS: ${WG_PEERS:-admin1,admin2,agenceweb}
+      PEERDNS: auto
+      INTERNAL_SUBNET: 10.13.13.0
+      # Routage côté client limité aux seules destinations utiles (split tunnel) ; le filtrage
+      # qui fait foi est celui du serveur (iptables FW1).
+      ALLOWEDIPS: 10.10.6.10/32,10.10.7.22/32,10.10.7.30/32,10.13.13.1/32
+      PERSISTENTKEEPALIVE_PEERS: all
+      # Ne pas afficher les configurations / QR codes (clés privées !) dans `docker logs`.
+      LOG_CONFS: "false"
+      # Politique FW1 (services/wireguard/custom-cont-init.d/50-ostral-fw1.sh)
+      WG_ADMIN_DESTS: ${WG_ADMIN_DESTS:-10.10.6.10:8080,10.10.7.22:5601,10.10.7.22:443,10.10.7.30:3001}
+      WG_RESTRICTED_PEERS: ${WG_RESTRICTED_PEERS:-agenceweb}
+      WG_RESTRICTED_DESTS: ${WG_RESTRICTED_DESTS:-10.10.6.10:8080}
+    ports:
+      - "51820:51820/udp"
+    volumes:
+      # Configurations serveur et pairs générées (clés privées) : gitignoré.
+      - ./services/wireguard/config:/config
+      - logs_wireguard:/var/log/wireguard
+    networks:
+      z0_internet:
+        ipv4_address: 10.10.0.20
+      z6_admin:
+        ipv4_address: 10.10.6.5
+      z7_supervision:
+        ipv4_address: 10.10.7.5
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.src_valid_mark: "1"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    # NET_ADMIN : interface wg0 + iptables ; les autres : init s6 de linuxserver (chown des
+    # fichiers, bascule vers l'utilisateur abc) et CoreDNS sur le port 53 du tunnel.
+    cap_add: [NET_ADMIN, NET_BIND_SERVICE, CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    healthcheck:
+      test: ["CMD-SHELL", "wg show wg0 >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    mem_limit: 128m
+    cpus: 0.5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # admin-target — serveur Linux de démonstration en Z3 (10.10.3.30).
+  # (Zone Z3, mais livré par le lot D car c'est la cible du bastion — F10 — et du pull de
+  # sauvegarde — F16.)
+  #   - SSH par clé uniquement, pas de root, AllowUsers ostral-admin@10.10.3.11 (guacd) et
+  #     backup-ro@10.10.3.41 (backup, commande forcée lecture seule) ;
+  #   - clé d'hôte et clé du bastion fournies par guac-init (volume admin_target_ssh, lecture seule) ;
+  #   - auth.log -> logs_admin_target (E08).
+  # ---------------------------------------------------------------------------
+  admin-target:
+    build: ./services/admin-target
+    image: ostral/admin-target:1.0.0
+    hostname: admin-target
+    depends_on:
+      guac-init:
+        condition: service_completed_successfully
+    environment:
+      # Clé PUBLIQUE du serveur de sauvegarde (lot E) — une ligne "ssh-ed25519 AAAA... commentaire".
+      BACKUP_SSH_PUBKEY: ${BACKUP_SSH_PUBKEY:-}
+    volumes:
+      - admin_target_ssh:/etc/ssh/ostral:ro
+      - logs_admin_target:/var/log/admin-target
+    networks:
+      z3_servers:
+        ipv4_address: 10.10.3.30
+    read_only: true
+    tmpfs:
+      # mode 0755 : StrictModes de sshd refuse un chemin de clés autorisées modifiable par tous.
+      - /run:size=4m,mode=0755
+      - /tmp:size=16m
+      - /home/ostral-admin:size=8m,uid=1000,gid=1000,mode=0700
+      - /home/backup-ro:size=1m,uid=1001,gid=1001,mode=0700
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    # sshd : séparation de privilèges (chroot /var/empty, changement d'UID/GID), port 22,
+    # attribution du pty à l'utilisateur, arrêt des processus enfants.
+    cap_add: [CHOWN, FOWNER, SETUID, SETGID, SYS_CHROOT, NET_BIND_SERVICE, KILL, AUDIT_WRITE]
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 \"$$(cat /run/sshd.pid)\" 2>/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    mem_limit: 64m
+    cpus: 0.25
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # PROFIL `demo` UNIQUEMENT (désactivé par défaut) : relais local vers le bastion pour une
+  # démonstration sans client WireGuard. `docker compose --profile demo up -d bastion-demo`
+  # puis http://127.0.0.1:8080/ sur l'hôte. Contourne F09 (le MFA et l'enregistrement restent
+  # appliqués) : écart assumé et limité à la boucle locale. IP hors tableau du SPEC (démo).
+  # ---------------------------------------------------------------------------
+  bastion-demo:
+    profiles: ["demo"]
+    build: ./services/guacamole/demo-proxy
+    image: ostral/bastion-demo:1.0.0
+    depends_on:
+      guacamole:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      z0_internet:
+        ipv4_address: 10.10.0.21
+      z6_admin:
+        ipv4_address: 10.10.6.6
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 32m
+    cpus: 0.25
+    restart: unless-stopped
+
+volumes:
+  guac_db_data:
+  guac_initdb_sql:
+  guac_sshkey:
+  admin_target_ssh:
+  guac_recordings:
+  logs_guacamole:
+  logs_wireguard:
+  logs_admin_target:

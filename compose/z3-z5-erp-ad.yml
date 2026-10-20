@@ -1,0 +1,265 @@
+# OSTRAL — Lot C — ERP Odoo (Z3), base PostgreSQL (Z4), annuaire Active Directory (Z5)
+# Fragment fusionné via COMPOSE_FILE (voir SPEC.md) : chemins relatifs à la racine du projet,
+# réseaux déclarés dans docker-compose.yml (référencés ici sans redéclaration).
+#
+# Cloisonnement (refus par défaut par appartenance réseau, FW2) :
+#   - erp-db   : z4_data UNIQUEMENT → aucune sortie réseau (E05) ; seuls odoo (F06) et backup (F16)
+#                y sont admis, filtrés en plus par pg_hba.conf (IP + scram-sha-256).
+#   - odoo     : z3_api (WAF → routes d'API uniquement, F05), z3_servers (supervision, sauvegarde,
+#                bastion), z4_data (F06), z5_identity (LDAP, F07/F08), z8_postes (salariés, F07).
+#                AUCUN port publié sur l'hôte.
+#   - samba-ad : z5_identity UNIQUEMENT (S3) ; ports d'authentification 53/88/389/636/445 (F08),
+#                aucun port publié ; administration via le bastion Z6 (guacd 10.10.5.11).
+#
+# Ordre de démarrage : erp-db (sain) → odoo-init (one-shot, idempotent) → odoo (sain)
+#                      → WAF / boutique (autres lots) ; samba-ad démarre en parallèle.
+
+x-c-hardening: &c-hardening
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+x-odoo-env: &odoo-env
+  ERP_DB_USER: ${ERP_DB_USER:-odoo}
+  ERP_DB_PASSWORD: ${ERP_DB_PASSWORD:?ERP_DB_PASSWORD requis}
+  ODOO_DB: ${ODOO_DB:-ostral}
+  ODOO_ADMIN_PASSWD: ${ODOO_ADMIN_PASSWD:?ODOO_ADMIN_PASSWD requis}
+  ODOO_WORKERS: ${ODOO_WORKERS:-2}
+  # F07/F08 : vérification du certificat LDAP de l'AD par l'AC exportée par samba-ad
+  LDAPTLS_CACERT: /run/samba-tls/ca.crt
+  LDAPTLS_REQCERT: demand
+
+services:
+  # ------------------------------------------------------------------ Z4 — base de l'ERP (S2)
+  erp-db:
+    <<: *c-hardening
+    build:
+      context: ./services/erp-db
+    image: ostral/erp-db:16.15-alpine3.24
+    container_name: ostral-erp-db
+    hostname: erp-db
+    user: postgres            # non-root (E12) ; le volume hérite des droits de l'image
+    read_only: true
+    tmpfs:
+      - /var/run/postgresql:mode=1777,size=8m
+      - /tmp:mode=1777,size=64m
+    cap_drop: [ALL]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${ERP_DB_ADMIN_PASSWORD:?ERP_DB_ADMIN_PASSWORD requis}
+      POSTGRES_INITDB_ARGS: "--auth-local=peer --auth-host=scram-sha-256 --data-checksums"
+      ERP_DB_USER: ${ERP_DB_USER:-odoo}
+      ERP_DB_NAME: ${ODOO_DB:-ostral}
+      ERP_DB_PASSWORD: ${ERP_DB_PASSWORD:?ERP_DB_PASSWORD requis}
+      ERP_DB_BACKUP_PASSWORD: ${ERP_DB_BACKUP_PASSWORD:?ERP_DB_BACKUP_PASSWORD requis}
+    command:
+      - postgres
+      - -c
+      - listen_addresses=*
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - max_connections=100
+      # E08 : journalisation des connexions/déconnexions et du DDL vers le volume logs_erp_db
+      - -c
+      - logging_collector=on
+      - -c
+      - log_directory=/var/log/postgresql
+      - -c
+      - log_filename=postgresql-%Y-%m-%d.log
+      - -c
+      - log_file_mode=0640
+      - -c
+      - log_rotation_age=1d
+      - -c
+      - log_connections=on
+      - -c
+      - log_disconnections=on
+      - -c
+      - log_line_prefix=%m [%p] %q%u@%d from %h app=%a
+      - -c
+      - log_statement=ddl
+      - -c
+      - log_min_duration_statement=2000
+      - -c
+      - log_lock_waits=on
+    volumes:
+      - erp_db_data:/var/lib/postgresql/data
+      - logs_erp_db:/var/log/postgresql
+    networks:
+      z4_data:
+        ipv4_address: 10.10.4.20
+    expose: ["5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h /var/run/postgresql -U postgres -d postgres -q"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 200
+
+  # ------------------------------------------------------------ Z5 — annuaire AD (S3, F08)
+  samba-ad:
+    <<: *c-hardening
+    build:
+      context: ./services/samba-ad
+    image: ostral/samba-ad:4.17-debian12.15
+    container_name: ostral-samba-ad
+    hostname: dc1
+    domainname: ostral.local
+    # Samba AD DC tourne en root (démon multi-processus qui change d'identité pour servir SMB).
+    # Système de fichiers racine en lecture seule : tout l'état est dans les volumes.
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+      - /run:mode=0755,size=16m
+      - /var/cache/samba:mode=0755,size=32m
+    cap_drop: [ALL]
+    cap_add:
+      - CHOWN             # provisionnement / SYSVOL : attribution des fichiers aux identités du domaine
+      - DAC_OVERRIDE      # smbd (root) accède aux fichiers SYSVOL appartenant à d'autres identités
+      - DAC_READ_SEARCH   # parcours de SYSVOL lors des vérifications d'ACL (samba-tool ntacl)
+      - FOWNER            # pose des ACL / horodatages sur des fichiers dont root n'est pas propriétaire
+      - FSETID            # conservation des bits setgid des répertoires SYSVOL
+      - SETUID            # smbd endosse l'identité de l'utilisateur authentifié
+      - SETGID            # idem pour les groupes
+      - KILL              # le processus maître signale ses fils ayant changé d'identité
+      - NET_BIND_SERVICE  # écoute sur 53, 88, 389, 445, 636 (< 1024)
+      - SYS_ADMIN         # ACL NT stockées dans les attributs étendus « security.NTACL » (xattr
+                          # de l'espace security.*, réservé à CAP_SYS_ADMIN) ; indispensable à
+                          # SYSVOL/GPO. Compensé par : no-new-privileges, réseau Z5 isolé,
+                          # pas de --privileged, pas d'accès aux périphériques.
+    environment:
+      SAMBA_REALM: OSTRAL.LOCAL
+      SAMBA_DOMAIN: OSTRAL
+      SAMBA_DC_HOSTNAME: dc1
+      SAMBA_DC_IP: 10.10.5.10
+      SAMBA_ADMIN_PASSWORD: ${SAMBA_ADMIN_PASSWORD:?SAMBA_ADMIN_PASSWORD requis}
+      SAMBA_ODOO_BIND_PASSWORD: ${SAMBA_ODOO_BIND_PASSWORD:?SAMBA_ODOO_BIND_PASSWORD requis}
+      SAMBA_DEMO_USER_PASSWORD: ${SAMBA_DEMO_USER_PASSWORD:?SAMBA_DEMO_USER_PASSWORD requis}
+    volumes:
+      - samba_data:/var/lib/samba
+      - logs_samba:/var/log/samba
+      - samba_tls:/export/tls
+    networks:
+      z5_identity:
+        ipv4_address: 10.10.5.10
+        # Nom présent dans le certificat LDAPS (vérification stricte côté Odoo et postes)
+        aliases: [dc1.ostral.local]
+    expose: ["53", "53/udp", "88", "88/udp", "389", "636", "445"]
+    ulimits:
+      nofile: { soft: 16384, hard: 16384 }
+    healthcheck:
+      test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/389 && </dev/tcp/127.0.0.1/636 && </dev/tcp/127.0.0.1/88"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 180s   # le premier provisionnement prend 1 à 2 minutes
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 300
+
+  # ------------------------------------------- Z3 — initialisation de l'ERP (one-shot, idempotent)
+  odoo-init:
+    <<: *c-hardening
+    image: odoo:17.0-20260908
+    container_name: ostral-odoo-init
+    restart: "no"
+    user: odoo
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=128m
+      - /run/odoo:mode=1777,size=4m
+    cap_drop: [ALL]
+    entrypoint: ["/bin/bash", "/opt/ostral/entrypoint.sh"]
+    command: ["init"]
+    environment:
+      <<: *odoo-env
+      ODOO_INIT_MODULES: base,sale_management,stock,account,auth_ldap
+      ODOO_WEB_ADMIN_PASSWORD: ${ODOO_WEB_ADMIN_PASSWORD:?ODOO_WEB_ADMIN_PASSWORD requis}
+      ODOO_API_USER: ${ODOO_API_USER:-api-boutique}
+      ODOO_API_KEY: ${ODOO_API_KEY:?ODOO_API_KEY requis}
+      SAMBA_ODOO_BIND_PASSWORD: ${SAMBA_ODOO_BIND_PASSWORD:?SAMBA_ODOO_BIND_PASSWORD requis}
+      ODOO_LDAP_SERVER: dc1.ostral.local
+      ODOO_LDAP_PORT: "389"
+      ODOO_LDAP_BASE: DC=ostral,DC=local
+    volumes:
+      - ./services/odoo:/opt/ostral:ro
+      - odoo_data:/var/lib/odoo
+      - logs_odoo:/var/log/odoo
+    networks:
+      # z4_data seulement : l'init n'a besoin que de la base (F06). IP dédiée, autorisée
+      # explicitement dans pg_hba.conf pour le même compte de service `odoo` (évite tout conflit
+      # d'adresse avec le service odoo lors d'un « docker compose up » ultérieur).
+      z4_data:
+        ipv4_address: 10.10.4.12
+    depends_on:
+      erp-db: { condition: service_healthy }
+    mem_limit: 1536m
+    cpus: 1.0
+    pids_limit: 200
+
+  # ------------------------------------------------------------------- Z3 — ERP Odoo (S2, A3)
+  odoo:
+    <<: *c-hardening
+    image: odoo:17.0-20260908
+    container_name: ostral-odoo
+    hostname: odoo
+    user: odoo                # utilisateur non privilégié de l'image officielle
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=256m
+      - /run/odoo:mode=1777,size=4m
+    cap_drop: [ALL]
+    entrypoint: ["/bin/bash", "/opt/ostral/entrypoint.sh"]
+    command: []
+    environment:
+      <<: *odoo-env
+    volumes:
+      - ./services/odoo:/opt/ostral:ro
+      - odoo_data:/var/lib/odoo
+      - logs_odoo:/var/log/odoo
+      - samba_tls:/run/samba-tls:ro
+    networks:
+      z3_api:
+        ipv4_address: 10.10.13.20  # F05 : WAF (10.10.13.10) → API Odoo (/jsonrpc, /xmlrpc/2/*)
+      z3_servers:
+        ipv4_address: 10.10.3.20   # Z3 : supervision (10.10.3.40), sauvegarde (10.10.3.41)
+      z4_data:
+        ipv4_address: 10.10.4.10   # F06 : seul client applicatif de erp-db
+      z5_identity:
+        ipv4_address: 10.10.5.20   # F07/F08 : authentification des salariés sur l'AD
+      z8_postes:
+        ipv4_address: 10.10.8.20   # F07 : postes de travail (usage métier)
+    expose: ["8069"]
+    # AUCUN « ports: » : l'ERP n'est jamais exposé sur l'hôte (F05)
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8069/web/health', timeout=5).status == 200 else 1)"]
+      interval: 20s
+      timeout: 10s
+      retries: 6
+      start_period: 60s
+    depends_on:
+      erp-db: { condition: service_healthy }
+      odoo-init: { condition: service_completed_successfully }
+      # L'AD n'est requis qu'à la connexion d'un salarié : l'ERP (et l'API boutique) démarre même
+      # si l'annuaire est indisponible (disponibilité S2, RTO ERP 8 h indépendant de l'AD).
+      samba-ad: { condition: service_started }
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 300
+
+volumes:
+  erp_db_data:
+  logs_erp_db:
+  odoo_data:
+  logs_odoo:
+  samba_data:
+  logs_samba:
+  samba_tls:

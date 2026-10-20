@@ -1,0 +1,26 @@
+{
+  "policy": {
+    "description": "OSTRAL E08 : alertes consultables 3 mois (90 jours) dans le SIEM puis suppression de l'index. Les archives brutes (logall_json) sont conservees 12 mois hors SIEM dans le depot de sauvegarde verrouille.",
+    "default_state": "consultable",
+    "states": [
+      {
+        "name": "consultable",
+        "actions": [],
+        "transitions": [
+          { "state_name": "suppression", "conditions": { "min_index_age": "90d" } }
+        ]
+      },
+      {
+        "name": "suppression",
+        "actions": [ { "delete": {} } ],
+        "transitions": []
+      }
+    ],
+    "ism_template": [
+      {
+        "index_patterns": [ "wazuh-alerts-*", "wazuh-archives-*" ],
+        "priority": 100
+      }
+    ]
+  }
+}

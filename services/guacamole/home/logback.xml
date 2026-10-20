@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  OSTRAL - lot D - journalisation du bastion Guacamole (E06, E08, SS5, R3)
+  Monté dans le modèle GUACAMOLE_HOME (/opt/ostral/guacamole-home) : l'image 1.6.0 lie les
+  fichiers de premier niveau de ce répertoire dans le GUACAMOLE_HOME généré au démarrage.
+  Sortie fichier : /var/log/guacamole/guacamole.log (volume logs_guacamole, lu par wazuh-manager)
+  -> authentifications réussies/échouées (utilisateur + IP), ouvertures/fermetures de connexions.
+  Sortie console conservée pour `docker compose logs guacamole`.
+-->
+<configuration>
+
+  <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <appender name="FICHIER" class="ch.qos.logback.core.rolling.RollingFileAppender">
+    <file>/var/log/guacamole/guacamole.log</file>
+    <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+      <fileNamePattern>/var/log/guacamole/guacamole.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+      <maxFileSize>20MB</maxFileSize>
+      <maxHistory>30</maxHistory>
+      <totalSizeCap>500MB</totalSizeCap>
+    </rollingPolicy>
+    <encoder>
+      <pattern>%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX} %-5level [%thread] %logger{36} - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <root level="info">
+    <appender-ref ref="CONSOLE"/>
+    <appender-ref ref="FICHIER"/>
+  </root>
+
+</configuration>

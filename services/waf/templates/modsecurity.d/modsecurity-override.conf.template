@@ -1,0 +1,28 @@
+# =============================================================================
+# OSTRAL — Lot B : règles ModSecurity locales (chargées AVANT le CRS, cf. setup.conf
+# de l'image). Le moteur, l'audit log et le CRS sont réglés par variables
+# d'environnement (compose/z2-dmz.yml) : MODSEC_RULE_ENGINE=on (blocage),
+# BLOCKING_PARANOIA, ANOMALY_INBOUND/OUTBOUND (anomaly scoring), MODSEC_AUDIT_*.
+# Plage d'identifiants réservée aux règles locales : 10000-10999.
+# =============================================================================
+
+# F05 — API ERP (port 9443) : /jsonrpc donne accès à plusieurs « services » Odoo,
+# dont « db » (lister / sauvegarder / supprimer les bases). Seuls « common »
+# (authentification) et « object » (execute_kw) sont nécessaires à la boutique.
+# Le corps doit être du JSON (Content-Type application/json) pour être analysé.
+
+# Service absent (ou corps non JSON) => refus
+SecRule SERVER_PORT "@eq 9443" \
+    "id:10010,phase:2,t:none,deny,status:403,log,auditlog,\
+    msg:'OSTRAL F05 : appel JSON-RPC sans service explicite',\
+    tag:'OSTRAL/F05',severity:'CRITICAL',chain"
+    SecRule REQUEST_FILENAME "@streq /jsonrpc" "chain"
+        SecRule &ARGS:json.params.service "@eq 0" "t:none"
+
+# Service autre que common / object (ex. db) => refus
+SecRule SERVER_PORT "@eq 9443" \
+    "id:10011,phase:2,t:none,deny,status:403,log,auditlog,\
+    msg:'OSTRAL F05 : service JSON-RPC interdit (seuls common et object)',\
+    tag:'OSTRAL/F05',severity:'CRITICAL',chain"
+    SecRule REQUEST_FILENAME "@streq /jsonrpc" "chain"
+        SecRule ARGS:json.params.service "!@rx ^(?:common|object)$" "t:none"

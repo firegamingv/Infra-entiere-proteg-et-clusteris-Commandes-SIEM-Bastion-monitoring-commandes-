@@ -1,0 +1,95 @@
+# =============================================================================
+# OSTRAL — Lot B : API ERP interne (F04 -> F05)
+#   boutique (Z1) --mTLS--> WAF 10.10.1.10:9443 (Z2) --HTTP--> odoo:8069 (Z3, réseau dédié z3_api)
+# Seul chemin du site vers le SI interne (E05). Contrôles cumulés :
+#   1. écoute UNIQUEMENT sur l'IP z1_cloud du WAF (jamais sur z0_internet) ;
+#   2. certificat client obligatoire, émis par l'AC interne OSTRAL (ssl_verify_client on),
+#      usage clientAuth exigé par OpenSSL côté serveur ;
+#   3. seul le CN « boutique » est accepté (sinon 403) ;
+#   4. seules les routes d'API Odoo en POST : /jsonrpc, /xmlrpc/2/common, /xmlrpc/2/object ;
+#      tout le reste (/web, /web/login, /odoo, /website, /xmlrpc/2/db…) => 403 (F05) ;
+#   5. ModSecurity/CRS inspecte aussi ce trafic + règles OSTRAL (services JSON-RPC
+#      limités à common/object, cf. modsecurity-override.conf).
+# =============================================================================
+
+# CN du certificat client (sujet au format RFC 2253 : « CN=boutique,OU=...,O=OSTRAL,C=FR »)
+map $ssl_client_s_dn $ostral_client_cn {
+    "~(?:^|,)CN=(?<ostral_cn>[^,]+)" $ostral_cn;
+    default "";
+}
+
+# Liste blanche des identités autorisées sur l'API ERP (F04)
+map $ostral_client_cn $ostral_erp_client_allowed {
+    boutique 1;
+    default  0;
+}
+
+server {
+    # F04 : IP du WAF sur z1_cloud uniquement (le port n'existe pas sur z0/z2/z3)
+    listen 10.10.1.10:9443 ssl;
+    server_name erp-api.ostral.internal waf;
+
+    ssl_certificate     /etc/nginx/certs/waf-erp-api.crt;
+    ssl_certificate_key /etc/nginx/certs/waf-erp-api.key;
+    include includes/ostral-tls.conf;
+
+    # mTLS (E03, F04) : AC interne comme seule ancre de confiance, chaîne de longueur 1
+    ssl_client_certificate /etc/nginx/certs/ca.crt;
+    ssl_verify_client on;
+    ssl_verify_depth 1;
+
+    modsecurity_transaction_id "$request_id";
+
+    limit_conn ostral_conn ${WAF_CONN_PER_IP};
+    client_max_body_size ${WAF_MAX_BODY_SIZE};
+
+    # F05 : amont Odoo (résolu dynamiquement : le WAF démarre sans le lot C)
+    set $ostral_odoo http://odoo:8069;
+
+    # 3. identité : certificat valide mais CN différent de « boutique » => 403
+    if ($ostral_erp_client_allowed = 0) {
+        return 403;
+    }
+
+    # 4. routes d'API Odoo autorisées, en POST uniquement (sinon 403)
+    location ~ ^/(?:jsonrpc|xmlrpc/2/common|xmlrpc/2/object)$ {
+        limit_except POST {
+            deny all;
+        }
+
+        proxy_pass $ostral_odoo;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Request-ID      $request_id;
+        # Identité mTLS vérifiée par le WAF, transmise à l'ERP pour traçabilité
+        proxy_set_header X-Ostral-Client-CN     $ostral_client_cn;
+        proxy_set_header X-Ostral-Client-Verify $ssl_client_verify;
+        proxy_set_header Proxy "";
+        # API sans état (authentification par utilisateur technique + clé API Odoo) :
+        # aucun cookie de session Odoo ne transite par ce chemin
+        proxy_set_header Cookie "";
+        proxy_hide_header Set-Cookie;
+
+        proxy_connect_timeout 5s;
+        proxy_send_timeout    30s;
+        proxy_read_timeout    60s;
+        proxy_next_upstream   off;
+
+        proxy_buffering on;
+        proxy_buffer_size 16k;
+        proxy_buffers 16 16k;
+        proxy_max_temp_file_size 0;
+        proxy_redirect off;
+    }
+
+    # F05 : interface web Odoo et toute autre route => interdit
+    location / {
+        return 403;
+    }
+}

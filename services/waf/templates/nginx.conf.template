@@ -1,0 +1,134 @@
+# =============================================================================
+# OSTRAL — Lot B : configuration principale nginx du WAF (Z2 DMZ)
+# Remplace le nginx.conf.template de l'image owasp/modsecurity-crs.
+# Les ${VAR} en MAJUSCULES sont substitués au démarrage (envsubst) depuis
+# l'environnement du conteneur (compose/z2-dmz.yml) ; les $variables nginx sont intactes.
+# Pas de stockage de données dans la DMZ : aucun cache proxy, aucun fichier servi.
+# =============================================================================
+
+# Modules dynamiques fournis par l'image : ModSecurity v3 et headers-more
+load_module modules/ngx_http_modsecurity_module.so;
+load_module modules/ngx_http_headers_more_filter_module.so;
+
+worker_processes ${NGINX_WORKER_PROCESSES};
+pid /tmp/nginx.pid;
+
+# Journal d'erreurs (inclut les alertes ModSecurity) : fichier pour le SIEM (E08)
+# + stderr pour « docker compose logs ».
+error_log /var/log/nginx/waf_error.log warn;
+error_log stderr warn;
+
+events {
+    worker_connections ${WORKER_CONNECTIONS};
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # ---------------------------------------------------------------- masquage
+    # Pas de version dans les en-têtes ni les pages d'erreur ; en-tête Server supprimé
+    server_tokens off;
+    more_clear_headers Server;
+    more_clear_headers X-Powered-By;
+
+    # ---------------------------------------------------------------- DNS Docker
+    # Résolution dynamique des amonts (boutique, odoo) via le DNS interne de Docker :
+    # nginx démarre même si les lots A / C ne sont pas encore lancés (502 en attendant).
+    resolver 127.0.0.11 valid=10s ipv6=off;
+    resolver_timeout 5s;
+
+    # ---------------------------------------------------------------- timeouts courts (SS4)
+    client_header_timeout 10s;
+    client_body_timeout   ${CLIENT_BODY_TIMEOUT};
+    send_timeout          10s;
+    keepalive_timeout     15s;
+    keepalive_requests    100;
+    reset_timedout_connection on;
+
+    # ---------------------------------------------------------------- tailles limitées
+    client_max_body_size        ${WAF_MAX_BODY_SIZE};
+    client_body_buffer_size     64k;
+    client_header_buffer_size   1k;
+    large_client_header_buffers 4 8k;
+
+    # Fichiers temporaires dans /tmp uniquement (aucune donnée persistante en DMZ)
+    client_body_temp_path /tmp/nginx_client_body 1 2;
+    proxy_temp_path       /tmp/nginx_proxy 1 2;
+    fastcgi_temp_path     /tmp/nginx_fastcgi;
+    uwsgi_temp_path       /tmp/nginx_uwsgi;
+    scgi_temp_path        /tmp/nginx_scgi;
+
+    sendfile on;
+    tcp_nopush on;
+
+    # ---------------------------------------------------------------- limitation de débit (E04, SS2, SS4)
+    # Limite globale par adresse IP source (toutes requêtes du vhost public)
+    limit_req_zone $binary_remote_addr zone=ostral_global:10m rate=${WAF_GLOBAL_RATE};
+
+    # Limite spécifique aux tentatives d'authentification (anti-bourrage d'identifiants,
+    # SS2) : seules les requêtes POST sont comptées (clé vide = non comptée), l'affichage
+    # du formulaire (GET /login) reste libre.
+    map $request_method $ostral_auth_key {
+        POST    $binary_remote_addr;
+        default "";
+    }
+    limit_req_zone $ostral_auth_key zone=ostral_auth:10m rate=${WAF_AUTH_RATE};
+
+    # Connexions simultanées par IP
+    limit_conn_zone $binary_remote_addr zone=ostral_conn:10m;
+
+    # Refus = HTTP 429 (Too Many Requests), journalisé en warn (indicateur SIEM « 429 »)
+    limit_req_status  429;
+    limit_conn_status 429;
+    limit_req_log_level  warn;
+    limit_conn_log_level warn;
+
+    # ---------------------------------------------------------------- journaux (E08)
+    # Classification de la réponse pour le SIEM : 403 = blocage WAF / F05, 429 = débit
+    map $status $ostral_waf_action {
+        403     "blocked";
+        429     "rate_limited";
+        495     "tls_client_cert_error";
+        496     "tls_client_cert_missing";
+        default "allowed";
+    }
+
+    # Access log JSON (une ligne par requête). request_id = identifiant de corrélation,
+    # repris comme identifiant de transaction ModSecurity (audit log) et transmis aux
+    # amonts dans X-Request-ID.
+    log_format ostral_json escape=json
+        '{'
+        '"timestamp":"$time_iso8601",'
+        '"source":"waf",'
+        '"zone":"Z2",'
+        '"request_id":"$request_id",'
+        '"client_ip":"$remote_addr",'
+        '"client_port":"$remote_port",'
+        '"server_addr":"$server_addr",'
+        '"server_port":"$server_port",'
+        '"server_name":"$server_name",'
+        '"host":"$host",'
+        '"method":"$request_method",'
+        '"uri":"$request_uri",'
+        '"protocol":"$server_protocol",'
+        '"status":$status,'
+        '"waf_action":"$ostral_waf_action",'
+        '"limit_req":"$limit_req_status",'
+        '"bytes_sent":$body_bytes_sent,'
+        '"request_length":$request_length,'
+        '"request_time":$request_time,'
+        '"upstream_addr":"$upstream_addr",'
+        '"upstream_status":"$upstream_status",'
+        '"upstream_response_time":"$upstream_response_time",'
+        '"tls_protocol":"$ssl_protocol",'
+        '"tls_cipher":"$ssl_cipher",'
+        '"tls_sni":"$ssl_server_name",'
+        '"client_cert_verify":"$ssl_client_verify",'
+        '"client_cert_subject":"$ssl_client_s_dn",'
+        '"user_agent":"$http_user_agent",'
+        '"referer":"$http_referer"'
+        '}';
+
+    include /etc/nginx/conf.d/*.conf;
+}

@@ -1,0 +1,71 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+# =============================================================================
+# OSTRAL — lot D — journal WireGuard pour le SIEM (E08, F09, SS5)
+#
+# Service longue durée (s6, /custom-services.d de linuxserver). Toutes les N secondes :
+#   - détecte les nouvelles sessions VPN par pair nominatif (handshake après inactivité) ;
+#   - compte les paquets refusés par la chaîne OSTRAL_WG_IN (FW1).
+# Sortie : /var/log/wireguard/wireguard.log (volume logs_wireguard, lu par wazuh-manager).
+# Format clé=valeur, une ligne par événement :
+#   2026-10-19T10:00:00Z ostral-wireguard: event=connexion peer=admin1 ip=10.13.13.2 endpoint=203.0.113.5:51000
+#
+# Remarque : les cibles LOG d'iptables écrivent dans le journal NOYAU de l'hôte (dmesg / VM
+# WSL2), pas dans le conteneur ; ce service fournit l'équivalent exploitable dans le volume.
+# =============================================================================
+set -uo pipefail
+
+LOG_DIR="/var/log/wireguard"
+LOG="$LOG_DIR/wireguard.log"
+WG_IF="${WG_INTERFACE:-wg0}"
+INTERVALLE="${WG_JOURNAL_INTERVAL:-30}"
+# Écart (s) entre deux handshakes au-delà duquel on considère une nouvelle session.
+SEUIL_SESSION="${WG_SESSION_GAP:-300}"
+
+mkdir -p "$LOG_DIR"
+
+declare -A noms dernier_hs
+drops_prec=0
+
+journal() { printf '%s ostral-wireguard: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG"; }
+
+charger_noms() {
+  local f nom
+  for f in /config/peer_*/publickey-peer_*; do
+    [[ -f "$f" ]] || continue
+    nom="${f##*/publickey-peer_}"
+    noms["$(tr -d '[:space:]' < "$f")"]="$nom"
+  done
+}
+
+journal "event=demarrage interface=$WG_IF intervalle=${INTERVALLE}s"
+
+while true; do
+  charger_noms
+  if wg show "$WG_IF" dump >/dev/null 2>&1; then
+    # Ligne 1 = l'interface ; lignes suivantes = un pair :
+    # clé_pub  psk  endpoint  allowed_ips  dernier_handshake  rx  tx  keepalive
+    while IFS=$'\t' read -r pub _psk endpoint allowed hs rx tx _ka; do
+      [[ -n "$pub" ]] || continue
+      nom="${noms[$pub]:-inconnu}"
+      prec="${dernier_hs[$pub]:-0}"
+      if [[ "$hs" =~ ^[0-9]+$ ]] && (( hs > 0 )) && (( hs != prec )); then
+        if (( prec == 0 || hs - prec > SEUIL_SESSION )); then
+          journal "event=connexion peer=$nom ip=${allowed%%/*} endpoint=$endpoint rx=$rx tx=$tx"
+        fi
+        dernier_hs[$pub]="$hs"
+      fi
+    done < <(wg show "$WG_IF" dump | tail -n +2)
+  fi
+
+  # Compteur de la règle DROP finale de OSTRAL_WG_IN (refus FW1 depuis le tunnel).
+  drops="$(iptables -w -L OSTRAL_WG_IN -v -n -x 2>/dev/null | awk '$3 == "DROP" { n = $1 } END { print n + 0 }')"
+  if [[ "$drops" =~ ^[0-9]+$ ]]; then
+    if (( drops > drops_prec )); then
+      journal "event=refus_fw1 paquets=$((drops - drops_prec)) total=$drops"
+    fi
+    drops_prec="$drops"
+  fi
+
+  sleep "$INTERVALLE"
+done

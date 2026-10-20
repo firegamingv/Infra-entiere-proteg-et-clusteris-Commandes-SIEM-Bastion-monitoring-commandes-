@@ -1,0 +1,76 @@
+# OSTRAL — maquette de l'architecture sécurisée (ateliers 1 à 3)
+# Fichier de base : déclare les zones réseau (Z0–Z8). Les services sont dans compose/*.yml,
+# fusionnés via COMPOSE_FILE (voir .env.example). Voir SPEC.md.
+name: ostral
+
+networks:
+  # Z0 — Internet simulé : seuls le WAF (F01) et le VPN (F09) y sont exposés
+  z0_internet:
+    driver: bridge
+    ipam:
+      config: [{ subnet: 10.10.0.0/24 }]
+  # Z1 — Cloud : boutique sans adresse publique, joignable uniquement par le WAF (F02)
+  z1_cloud:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.10.1.0/24 }]
+  # Z1 — base managée de la boutique
+  z1_data:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.10.12.0/24 }]
+  # F03 — sortie de la boutique vers PSP et transporteurs (simulés)
+  z1_egress:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.10.11.0/24 }]
+  # Z2 — DMZ entre FW1 et FW2
+  z2_dmz:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.10.2.0/24 }]
+  # Z3 — serveurs internes (ERP)
+  z3_servers:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.10.3.0/24 }]
+  # F05 — segment dédié reverse proxy (Z2) → API ERP (Z3) : seuls waf et odoo y sont.
+  # Évite que le WAF puisse joindre les autres serveurs de Z3 (F14).
+  z3_api:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.10.13.0/24 }]
+  # Z4 — données sensibles : aucune sortie réseau (E05)
+  z4_data:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.10.4.0/24 }]
+  # Z5 — identité (Active Directory)
+  z5_identity:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.10.5.0/24 }]
+  # Z6 — administration (bastion)
+  z6_admin:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.10.6.0/24 }]
+  z6_data:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.10.16.0/24 }]
+  # Z7 — supervision, SIEM, sauvegarde
+  z7_supervision:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.10.7.0/24 }]
+  # F17 — copie hors site vers un second fournisseur
+  z7_offsite:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.10.17.0/24 }]
+  # Z8 — postes de travail : pas d'Internet direct (F13)
+  z8_postes:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.10.8.0/24 }]

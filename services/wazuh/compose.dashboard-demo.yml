@@ -1,0 +1,9 @@
+# OSTRAL — OPTION DÉMO (hors cible) : publie le Wazuh dashboard sur 127.0.0.1:5601 de l'hôte.
+# En cible, la console n'est accessible que via le VPN d'administration (F09, Z7).
+# Usage : ajouter ce fichier en DERNIER dans COMPOSE_FILE, par ex. (séparateur ':' ou ';' sous Windows)
+#   COMPOSE_FILE=docker-compose.yml:compose/...:compose/z7-supervision.yml:services/wazuh/compose.dashboard-demo.yml
+# puis : docker compose --profile siem up -d   →   https://127.0.0.1:5601 (compte admin / INDEXER_PASSWORD)
+services:
+  wazuh-dashboard:
+    ports:
+      - "127.0.0.1:5601:5601"

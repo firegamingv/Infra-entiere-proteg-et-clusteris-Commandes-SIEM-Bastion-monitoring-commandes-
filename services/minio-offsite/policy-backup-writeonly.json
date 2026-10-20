@@ -1,0 +1,47 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OstralBackupListeEtMetadonnees",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetBucketLocation",
+        "s3:GetBucketObjectLockConfiguration",
+        "s3:GetBucketVersioning",
+        "s3:ListBucketMultipartUploads"
+      ],
+      "Resource": [ "arn:aws:s3:::__BUCKET__" ]
+    },
+    {
+      "Sid": "OstralBackupEcritureSeule",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:ListMultipartUploadParts",
+        "s3:AbortMultipartUpload"
+      ],
+      "Resource": [ "arn:aws:s3:::__BUCKET__/*" ]
+    },
+    {
+      "Sid": "OstralBackupInterditSuppressionEtDeverrouillage",
+      "Effect": "Deny",
+      "Action": [
+        "s3:DeleteObject",
+        "s3:DeleteObjectVersion",
+        "s3:DeleteBucket",
+        "s3:PutBucketVersioning",
+        "s3:PutBucketObjectLockConfiguration",
+        "s3:PutObjectRetention",
+        "s3:PutObjectLegalHold",
+        "s3:BypassGovernanceRetention",
+        "s3:PutBucketPolicy",
+        "s3:DeleteBucketPolicy",
+        "s3:PutLifecycleConfiguration",
+        "s3:GetObject",
+        "s3:GetObjectVersion"
+      ],
+      "Resource": [ "arn:aws:s3:::__BUCKET__", "arn:aws:s3:::__BUCKET__/*" ]
+    }
+  ]
+}

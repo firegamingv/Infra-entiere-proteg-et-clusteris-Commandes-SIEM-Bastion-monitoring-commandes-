@@ -1,0 +1,17 @@
+{
+  "name": "ostral-psp-mock",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OSTRAL - PSP et transporteur simulés (Z0 logique) : page de paiement hébergée (E02, SAQ A), notification signée HMAC, API étiquettes (F03)",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "4.21.2",
+    "helmet": "8.0.0"
+  }
+}

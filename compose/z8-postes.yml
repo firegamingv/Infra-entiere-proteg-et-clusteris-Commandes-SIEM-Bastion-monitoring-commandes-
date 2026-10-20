@@ -1,0 +1,40 @@
+# =============================================================================
+# OSTRAL — lot D — Z8 postes de travail
+# Poste simulé servant aux tests de la matrice de flux :
+#   F07  poste -> ERP Odoo 8069 (odoo est attaché à z8_postes : 10.10.8.20)   AUTORISÉ
+#   F08  poste -> annuaire AD (z5_identity : 10.10.5.10)                       AUTORISÉ
+#   F13  poste -> Internet en direct : z8_postes est "internal", pas de passerelle  BLOQUÉ
+#   F15  poste -> serveurs en SSH/RDP direct : le poste n'est attaché ni à z3_servers ni à
+#        z6_admin, admin-target n'accepte SSH que depuis le bastion                BLOQUÉ (E06)
+# Le pare-feu FW2 est modélisé par l'appartenance réseau (refus par défaut, voir SPEC.md).
+# Auto-test : docker compose exec poste test-flux-poste
+# =============================================================================
+
+services:
+
+  poste:
+    build: ./services/poste
+    image: ostral/poste:1.0.0
+    hostname: poste-z8
+    user: "1000:1000"
+    environment:
+      ODOO_IP: 10.10.8.20
+      AD_IP: 10.10.5.10
+    networks:
+      z8_postes:
+        ipv4_address: 10.10.8.30
+      z5_identity:
+        ipv4_address: 10.10.5.30
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1 || exit 1"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    mem_limit: 64m
+    cpus: 0.25
+    restart: unless-stopped

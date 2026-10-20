@@ -1,0 +1,7 @@
+# OSTRAL — planning de sauvegarde (supercronic, heure de Paris). flock : une seule tâche restic à la fois.
+# RPO ERP 1 h (dossier p. 10) : dump horaire de la base ERP + copie hors site incrémentale.
+5 * * * *   flock -w 3000 /var/lib/backup/scratch/.job.lock /usr/local/bin/backup-hourly.sh
+# Nuit : pull SSH admin-target, filestore Odoo, archives Wazuh (E08), rétention, vérification, hors site.
+30 1 * * *  flock -w 3000 /var/lib/backup/scratch/.job.lock /usr/local/bin/backup-nightly.sh
+# Test mensuel de restauration de l'ERP dans un PostgreSQL isolé (calendrier de tests p. 11, E10).
+0 4 1 * *   flock -w 3000 /var/lib/backup/scratch/.job.lock /usr/local/bin/restore-test.sh

@@ -1,0 +1,477 @@
+<!--
+  OSTRAL — règles locales Wazuh (E08, journaux collectés p. 12 du dossier).
+  Échelle d'alerte du dossier (p. 12) :
+    - niveau >= 10 : SMS à l'astreinte (incidents critiques) ;
+    - niveaux 7 à 9 : e-mail ;
+    - niveaux < 7  : consultables dans le SIEM (3 mois) et archivés (12 mois).
+  Identifiants 100100-100999 réservés à OSTRAL. Sources identifiées par <location> (chemin du
+  volume logs_* monté sous /var/log/ostral/<service>/) et/ou par décodeur.
+  Scénarios couverts : SS2 (piratage en masse de comptes clients), attaques web (403 ModSecurity),
+  compromission d'identité AD (ajout aux groupes d'administrateurs), R3/SS3 (bastion hors horaires,
+  compte prestataire), E09 (échec de sauvegarde).
+-->
+<group name="local,ostral,">
+
+  <!-- ================================================================== -->
+  <!-- Z1 — Boutique (lot A) : JSON {"service":"boutique","event":"login_failed","ip":...,"email":...} -->
+  <!-- ================================================================== -->
+  <rule id="100100" level="0">
+    <decoded_as>json</decoded_as>
+    <location>/var/log/ostral/boutique/</location>
+    <description>OSTRAL boutique : événement applicatif</description>
+    <group>ostral_boutique,</group>
+  </rule>
+
+  <rule id="100101" level="5">
+    <if_sid>100100</if_sid>
+    <field name="event" type="pcre2">(?i)^(?:login[._-]?fail(?:ed|ure)?|auth[._-]?(?:login[._-]?)?fail(?:ed|ure)?)$</field>
+    <description>OSTRAL boutique : échec de connexion client ($(email)) depuis $(ip)</description>
+    <group>authentication_failed,ostral_boutique_login_failed,pci_dss_10.2.4,gdpr_IV_35.7.d,</group>
+  </rule>
+
+  <rule id="100102" level="5">
+    <if_sid>100100</if_sid>
+    <field name="event" type="pcre2">(?i)^(?:account[._-]?locked|login[._-]?locked)$</field>
+    <description>OSTRAL boutique : compte client verrouillé ($(email))</description>
+    <group>authentication_failed,ostral_boutique_login_failed,</group>
+  </rule>
+
+  <!-- SS2 : bourrage d'identifiants depuis une même IP -->
+  <rule id="100103" level="10" frequency="10" timeframe="60">
+    <if_matched_group>ostral_boutique_login_failed</if_matched_group>
+    <same_field>ip</same_field>
+    <description>OSTRAL SS2 : rafale d'échecs de connexion boutique depuis $(ip) (>= 10 en 60 s) - bourrage d'identifiants</description>
+    <mitre>
+      <id>T1110.004</id>
+    </mitre>
+    <group>authentication_failures,ostral_ss2,pci_dss_11.4,</group>
+  </rule>
+
+  <!-- SS2 : piratage EN MASSE (toutes IP confondues, attaque distribuée / botnet) -->
+  <rule id="100104" level="12" frequency="30" timeframe="120">
+    <if_matched_group>ostral_boutique_login_failed</if_matched_group>
+    <description>OSTRAL SS2 : piratage en masse de comptes clients (>= 30 échecs de connexion en 2 min, toutes IP)</description>
+    <mitre>
+      <id>T1110.004</id>
+    </mitre>
+    <group>authentication_failures,ostral_ss2,</group>
+  </rule>
+
+  <!-- ================================================================== -->
+  <!-- Z2 — WAF (lot B) : waf_access.json {"status":403,"waf_action":"blocked","client_ip":...} -->
+  <!-- ================================================================== -->
+  <rule id="100200" level="0">
+    <decoded_as>json</decoded_as>
+    <location>/var/log/ostral/waf/waf_access.json</location>
+    <description>OSTRAL WAF : requête HTTP</description>
+    <group>ostral_waf,web,accesslog,</group>
+  </rule>
+
+  <rule id="100201" level="6">
+    <if_sid>100200</if_sid>
+    <status>^429$</status>
+    <description>OSTRAL WAF : limitation de débit (429) pour $(client_ip) sur $(uri)</description>
+    <group>ostral_waf_429,</group>
+  </rule>
+
+  <!-- SS2 : la limitation de débit se déclenche en rafale (login/register) => bourrage d'identifiants -->
+  <rule id="100202" level="10" frequency="20" timeframe="60">
+    <if_matched_sid>100201</if_matched_sid>
+    <description>OSTRAL SS2 : rafale de réponses 429 du WAF (>= 20 en 60 s) - piratage de comptes clients probable</description>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
+    <group>ostral_ss2,attack,</group>
+  </rule>
+
+  <rule id="100203" level="5">
+    <if_sid>100200</if_sid>
+    <status>^403$</status>
+    <description>OSTRAL WAF : requête bloquée (403) de $(client_ip) vers $(host)$(uri)</description>
+    <group>ostral_waf_403,attack,</group>
+  </rule>
+
+  <rule id="100204" level="10" frequency="10" timeframe="120">
+    <if_matched_sid>100203</if_matched_sid>
+    <same_field>client_ip</same_field>
+    <description>OSTRAL : attaque web répétée bloquée par le WAF depuis $(client_ip) (>= 10 x 403 en 2 min)</description>
+    <mitre>
+      <id>T1190</id>
+    </mitre>
+    <group>attack,web_scan,</group>
+  </rule>
+
+  <!-- Erreurs serveur (seuil e-mail du dossier : > 2 % de 5xx ; approché par un volume absolu) -->
+  <rule id="100205" level="3">
+    <if_sid>100200</if_sid>
+    <status>^5\d\d$</status>
+    <description>OSTRAL WAF : erreur serveur $(status) sur $(uri)</description>
+    <group>ostral_waf_5xx,</group>
+  </rule>
+
+  <rule id="100206" level="7" frequency="20" timeframe="300">
+    <if_matched_sid>100205</if_matched_sid>
+    <description>OSTRAL disponibilité : taux d'erreurs 5xx élevé sur la boutique (>= 20 en 5 min) - e-mail</description>
+    <group>ostral_availability,</group>
+  </rule>
+
+  <!-- F04 : appel de l'API ERP sans certificat client valide -->
+  <rule id="100207" level="8">
+    <if_sid>100200</if_sid>
+    <status>^49[56]$</status>
+    <description>OSTRAL F04 : appel de l'API ERP sans certificat client mTLS valide depuis $(client_ip)</description>
+    <group>authentication_failed,ostral_mtls,</group>
+  </rule>
+
+  <!-- ModSecurity v3 : audit log JSON (transaction.response.http_code) -->
+  <rule id="100210" level="0">
+    <decoded_as>json</decoded_as>
+    <location>/var/log/ostral/waf/modsec_audit.json</location>
+    <description>OSTRAL ModSecurity : transaction auditée</description>
+    <group>ostral_modsec,</group>
+  </rule>
+
+  <rule id="100211" level="7">
+    <if_sid>100210</if_sid>
+    <field name="transaction.response.http_code">^403$</field>
+    <description>OSTRAL ModSecurity : attaque web bloquée (403) depuis $(transaction.client_ip) sur $(transaction.request.uri)</description>
+    <mitre>
+      <id>T1190</id>
+    </mitre>
+    <group>attack,web,ostral_modsec_block,</group>
+  </rule>
+
+  <rule id="100212" level="8">
+    <if_sid>100211</if_sid>
+    <regex type="pcre2">(?i)(?:sql injection|SQLi|cross-site scripting|XSS|remote command execution|RCE|path traversal|local file inclusion|Java attack|PHP injection)</regex>
+    <description>OSTRAL ModSecurity : injection bloquée (SQLi/XSS/RCE/LFI) depuis $(transaction.client_ip)</description>
+    <mitre>
+      <id>T1190</id>
+    </mitre>
+    <group>attack,web,ostral_modsec_block,</group>
+  </rule>
+
+  <rule id="100213" level="10" frequency="5" timeframe="120">
+    <if_matched_sid>100212</if_matched_sid>
+    <same_field>transaction.client_ip</same_field>
+    <description>OSTRAL : campagne d'injections web depuis $(transaction.client_ip) (>= 5 en 2 min)</description>
+    <mitre>
+      <id>T1190</id>
+    </mitre>
+    <group>attack,web,</group>
+  </rule>
+
+  <!-- ================================================================== -->
+  <!-- Z3 — ERP Odoo (lot C)                                              -->
+  <!-- ================================================================== -->
+  <rule id="100300" level="0">
+    <decoded_as>ostral-odoo</decoded_as>
+    <description>OSTRAL Odoo : journal ERP</description>
+    <group>ostral_odoo,</group>
+  </rule>
+
+  <rule id="100301" level="5">
+    <if_sid>100300</if_sid>
+    <field name="odoo_login_result">^failed$</field>
+    <description>OSTRAL Odoo : échec de connexion à l'ERP ($(dstuser)) depuis $(srcip)</description>
+    <group>authentication_failed,</group>
+  </rule>
+
+  <rule id="100302" level="3">
+    <if_sid>100300</if_sid>
+    <field name="odoo_login_result">^successful$</field>
+    <description>OSTRAL Odoo : connexion à l'ERP ($(dstuser)) depuis $(srcip)</description>
+    <group>authentication_success,</group>
+  </rule>
+
+  <rule id="100303" level="10" frequency="8" timeframe="120">
+    <if_matched_sid>100301</if_matched_sid>
+    <same_srcip />
+    <description>OSTRAL Odoo : force brute sur l'ERP depuis $(srcip) (>= 8 échecs en 2 min)</description>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
+    <group>authentication_failures,</group>
+  </rule>
+
+  <!-- ================================================================== -->
+  <!-- Z4 — PostgreSQL ERP (lot C)                                        -->
+  <!-- ================================================================== -->
+  <rule id="100350" level="0">
+    <decoded_as>ostral-pgsql</decoded_as>
+    <description>OSTRAL PostgreSQL ERP : journal</description>
+    <group>ostral_erp_db,</group>
+  </rule>
+
+  <rule id="100351" level="5">
+    <if_sid>100350</if_sid>
+    <field name="pg_error">\.+</field>
+    <description>OSTRAL PostgreSQL ERP : connexion refusée ($(pg_error)) pour $(dstuser) depuis $(srcip)</description>
+    <group>authentication_failed,</group>
+  </rule>
+
+  <rule id="100352" level="10" frequency="6" timeframe="120">
+    <if_matched_sid>100351</if_matched_sid>
+    <description>OSTRAL PostgreSQL ERP : rafale de connexions refusées sur la base sensible Z4</description>
+    <group>authentication_failures,</group>
+  </rule>
+
+  <rule id="100353" level="7">
+    <if_sid>100350</if_sid>
+    <field name="pg_ddl">\.+</field>
+    <description>OSTRAL PostgreSQL ERP : modification de schéma ou de droits ($(pg_ddl)) par $(dstuser)</description>
+    <group>ostral_ddl,</group>
+  </rule>
+
+  <rule id="100354" level="10">
+    <if_sid>100353</if_sid>
+    <field name="pg_ddl" type="pcre2">(?i)^(?:ALTER|CREATE|DROP)\s+(?:ROLE|USER)|^GRANT</field>
+    <description>OSTRAL PostgreSQL ERP : création/modification de rôle ou octroi de droits ($(pg_ddl)) par $(dstuser)</description>
+    <mitre>
+      <id>T1098</id>
+    </mitre>
+    <group>ostral_ddl,</group>
+  </rule>
+
+  <!-- ================================================================== -->
+  <!-- Z5 — Annuaire Samba AD (lot C)                                     -->
+  <!-- ================================================================== -->
+  <rule id="100400" level="0">
+    <decoded_as>ostral-samba</decoded_as>
+    <description>OSTRAL AD : événement d'audit Samba</description>
+    <group>ostral_ad,</group>
+  </rule>
+
+  <!-- Compromission d'identité : ajout à un groupe d'administrateurs (dont GG-Admins OSTRAL) -->
+  <rule id="100401" level="12">
+    <if_sid>100400</if_sid>
+    <regex type="pcre2">"groupChange".*"action":\s*"Added".*"group":\s*"CN=(?:Domain Admins|Enterprise Admins|Schema Admins|Administrators|Admins du domaine|Administrateurs|GG-Admins[^,"]*|Group Policy Creator Owners|DnsAdmins|Backup Operators|Account Operators|Server Operators),</regex>
+    <description>OSTRAL AD : ajout d'un compte à un groupe d'administrateurs (Domain Admins / GG-Admins...)</description>
+    <mitre>
+      <id>T1098</id>
+    </mitre>
+    <group>adduser,group_changed,ostral_ad_admin,pci_dss_10.2.5,</group>
+  </rule>
+
+  <rule id="100402" level="5">
+    <if_sid>100400</if_sid>
+    <regex type="pcre2">"Authentication".*"status":\s*"NT_STATUS_(?:WRONG_PASSWORD|NO_SUCH_USER|LOGON_FAILURE|ACCOUNT_LOCKED_OUT|ACCOUNT_DISABLED)"</regex>
+    <description>OSTRAL AD : échec d'authentification sur l'annuaire</description>
+    <group>authentication_failed,</group>
+  </rule>
+
+  <rule id="100403" level="10" frequency="10" timeframe="120">
+    <if_matched_sid>100402</if_matched_sid>
+    <description>OSTRAL AD : rafale d'échecs d'authentification (force brute / pulvérisation de mots de passe)</description>
+    <mitre>
+      <id>T1110.003</id>
+    </mitre>
+    <group>authentication_failures,</group>
+  </rule>
+
+  <rule id="100404" level="8">
+    <if_sid>100400</if_sid>
+    <regex type="pcre2">"dsdbChange".*"operation":\s*"Add".*CN=Users|"dsdbChange".*"operation":\s*"Add".*OU=</regex>
+    <description>OSTRAL AD : création d'un objet (compte) dans l'annuaire</description>
+    <group>adduser,</group>
+  </rule>
+
+  <!-- ================================================================== -->
+  <!-- Z6 — Bastion Guacamole (lot D) : R3, SS3, E07                      -->
+  <!-- ================================================================== -->
+  <rule id="100500" level="0">
+    <decoded_as>ostral-guacamole</decoded_as>
+    <description>OSTRAL bastion : journal Guacamole</description>
+    <group>ostral_bastion,</group>
+  </rule>
+
+  <rule id="100501" level="3">
+    <if_sid>100500</if_sid>
+    <match>successfully authenticated</match>
+    <description>OSTRAL bastion : ouverture de session de $(dstuser) depuis $(srcip)</description>
+    <group>authentication_success,</group>
+  </rule>
+
+  <!-- Compte prestataire (agence-web, presta-*, ext-*) : toujours notifié par e-mail -->
+  <rule id="100502" level="8">
+    <if_sid>100501</if_sid>
+    <user type="pcre2">(?i)^(?:agence[-_.]|presta|ext[-_.])</user>
+    <description>OSTRAL bastion : connexion d'un compte PRESTATAIRE ($(dstuser)) depuis $(srcip)</description>
+    <group>ostral_prestataire,</group>
+  </rule>
+
+  <rule id="100503" level="12">
+    <if_sid>100502</if_sid>
+    <time>7 pm - 7:30 am</time>
+    <description>OSTRAL bastion : compte PRESTATAIRE connecté HORS HORAIRES ($(dstuser)) - SS3</description>
+    <mitre>
+      <id>T1078</id>
+    </mitre>
+    <group>ostral_prestataire,ostral_hors_horaires,</group>
+  </rule>
+
+  <rule id="100504" level="12">
+    <if_sid>100502</if_sid>
+    <weekday>weekends</weekday>
+    <description>OSTRAL bastion : compte PRESTATAIRE connecté le WEEK-END ($(dstuser)) - SS3</description>
+    <mitre>
+      <id>T1078</id>
+    </mitre>
+    <group>ostral_prestataire,ostral_hors_horaires,</group>
+  </rule>
+
+  <rule id="100505" level="10">
+    <if_sid>100501</if_sid>
+    <time>7 pm - 7:30 am</time>
+    <description>OSTRAL bastion : connexion HORS HORAIRES de $(dstuser) depuis $(srcip) - R3</description>
+    <mitre>
+      <id>T1078</id>
+    </mitre>
+    <group>ostral_hors_horaires,</group>
+  </rule>
+
+  <rule id="100506" level="10">
+    <if_sid>100501</if_sid>
+    <weekday>weekends</weekday>
+    <description>OSTRAL bastion : connexion le WEEK-END de $(dstuser) depuis $(srcip) - R3</description>
+    <mitre>
+      <id>T1078</id>
+    </mitre>
+    <group>ostral_hors_horaires,</group>
+  </rule>
+
+  <rule id="100507" level="5">
+    <if_sid>100500</if_sid>
+    <match>Authentication attempt from</match>
+    <description>OSTRAL bastion : échec d'authentification de $(dstuser) depuis $(srcip)</description>
+    <group>authentication_failed,</group>
+  </rule>
+
+  <rule id="100508" level="10" frequency="6" timeframe="120">
+    <if_matched_sid>100507</if_matched_sid>
+    <description>OSTRAL bastion : rafale d'échecs d'authentification (>= 6 en 2 min) - R3</description>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
+    <group>authentication_failures,</group>
+  </rule>
+
+  <!-- ================================================================== -->
+  <!-- Z3 — Serveur cible d'administration (lot D) : auth.log (sshd)       -->
+  <!-- 5715 = règle native « sshd: authentication success ». Le décodeur   -->
+  <!-- natif « sshd » filtre program_name ^sshd : couvre aussi sshd-session -->
+  <!-- (OpenSSH >= 9.8).                                                    -->
+  <!-- ================================================================== -->
+  <rule id="100600" level="10">
+    <if_sid>5715</if_sid>
+    <location>/var/log/ostral/admin-target/</location>
+    <time>7 pm - 7:30 am</time>
+    <user type="pcre2" negate="yes">^backup(?:-ro)?$</user>
+    <description>OSTRAL : connexion SSH HORS HORAIRES sur un serveur ($(dstuser) depuis $(srcip)) - hors compte de sauvegarde</description>
+    <mitre>
+      <id>T1078</id>
+    </mitre>
+    <group>ostral_hors_horaires,</group>
+  </rule>
+
+  <rule id="100601" level="10">
+    <if_sid>5715</if_sid>
+    <location>/var/log/ostral/admin-target/</location>
+    <user type="pcre2">^backup(?:-ro)?$</user>
+    <srcip negate="yes">10.10.3.41</srcip>
+    <description>OSTRAL F16 : clé de sauvegarde utilisée depuis une autre adresse que le serveur de sauvegarde ($(srcip))</description>
+    <mitre>
+      <id>T1078</id>
+    </mitre>
+    <group>ostral_backup,</group>
+  </rule>
+
+  <!-- ================================================================== -->
+  <!-- Z6/FW1 — WireGuard (lot D) : wireguard.log clé=valeur, F09        -->
+  <!-- ================================================================== -->
+  <rule id="100640" level="0">
+    <decoded_as>ostral-wireguard</decoded_as>
+    <location>/var/log/ostral/wireguard/</location>
+    <description>OSTRAL VPN : événement WireGuard</description>
+    <group>ostral_vpn,</group>
+  </rule>
+
+  <rule id="100641" level="3">
+    <if_sid>100640</if_sid>
+    <field name="wg_event">^connexion$</field>
+    <description>OSTRAL VPN : connexion de $(dstuser) depuis $(srcip)</description>
+    <group>ostral_vpn,authentication_success,</group>
+  </rule>
+
+  <rule id="100642" level="10">
+    <if_sid>100641</if_sid>
+    <time>7 pm - 7:30 am</time>
+    <description>OSTRAL VPN : connexion d'administration HORS HORAIRES ($(dstuser) depuis $(srcip)) - R3</description>
+    <mitre>
+      <id>T1133</id>
+    </mitre>
+    <group>ostral_vpn,ostral_hors_horaires,</group>
+  </rule>
+
+  <!-- Refus FW1 (préfixe iptables OSTRAL-FW1-DROP-*) si présents dans le journal -->
+  <rule id="100650" level="4">
+    <location>/var/log/ostral/wireguard/</location>
+    <match>OSTRAL-FW1-DROP-</match>
+    <description>OSTRAL FW1 : flux refusé depuis le VPN d'administration</description>
+    <group>firewall_drop,</group>
+  </rule>
+
+  <rule id="100651" level="10" frequency="30" timeframe="60">
+    <if_matched_sid>100650</if_matched_sid>
+    <description>OSTRAL FW1 : balayage / mouvement latéral depuis le VPN (>= 30 refus en 60 s)</description>
+    <mitre>
+      <id>T1046</id>
+    </mitre>
+    <group>firewall_drop,attack,</group>
+  </rule>
+
+  <!-- ================================================================== -->
+  <!-- Z7 — Sauvegarde (lot E) : backup.json {"status":"OK|ECHEC","job":...} -->
+  <!-- ================================================================== -->
+  <rule id="100700" level="0">
+    <decoded_as>json</decoded_as>
+    <location>/var/log/ostral/backup/</location>
+    <field name="service">^backup$</field>
+    <description>OSTRAL sauvegarde : journal</description>
+    <group>ostral_backup,</group>
+  </rule>
+
+  <rule id="100701" level="3">
+    <if_sid>100700</if_sid>
+    <status>^OK$</status>
+    <description>OSTRAL sauvegarde : tâche $(job) réussie</description>
+    <group>ostral_backup,</group>
+  </rule>
+
+  <rule id="100702" level="12">
+    <if_sid>100700</if_sid>
+    <status>^ECHEC$</status>
+    <description>OSTRAL E09 : ÉCHEC de la tâche de sauvegarde $(job) - $(message)</description>
+    <group>ostral_backup,ostral_backup_failed,</group>
+  </rule>
+
+  <rule id="100703" level="12">
+    <if_sid>100702</if_sid>
+    <field name="job">^restore-test$</field>
+    <description>OSTRAL E10 : ÉCHEC du test mensuel de restauration de l'ERP - $(message)</description>
+    <group>ostral_backup,ostral_backup_failed,</group>
+  </rule>
+
+  <!-- ================================================================== -->
+  <!-- Capacité : disque > 85 % (seuil e-mail du dossier, p. 12)           -->
+  <!-- 530 = règle native de sortie de commande (localfile command)         -->
+  <!-- ================================================================== -->
+  <rule id="100900" level="7">
+    <if_sid>530</if_sid>
+    <match>ossec: output: 'df -P': </match>
+    <regex type="pcre2">\s(?:8[5-9]|9\d|100)%\s</regex>
+    <description>OSTRAL capacité : système de fichiers rempli à plus de 85 %</description>
+    <group>low_diskspace,ostral_availability,</group>
+  </rule>
+
+</group>

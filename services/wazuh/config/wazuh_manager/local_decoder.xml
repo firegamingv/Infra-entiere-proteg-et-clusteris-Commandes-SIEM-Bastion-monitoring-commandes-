@@ -1,0 +1,91 @@
+<!--
+  OSTRAL — décodeurs locaux Wazuh (E08). Les journaux JSON (boutique, WAF, ModSecurity, sauvegarde)
+  sont décodés par le décodeur « json » natif ; ces décodeurs couvrent les journaux TEXTE.
+  Convention Wazuh : les décodeurs enfants portent le nom du parent (utilisé par <decoded_as>).
+  Expressions PCRE2 (type="pcre2"), sans ancrage sur l'horodatage (le pré-décodeur peut le retirer).
+-->
+
+<!-- ===================== Z3 — Odoo (lot C) ===================== -->
+<!-- 2026-10-19 10:00:00,123 7 INFO ostral odoo.addons.base.models.res_users: Login failed for db:ostral login:jdupont from 10.10.13.10 -->
+<decoder name="ostral-odoo">
+  <prematch type="pcre2">\d+ (?:DEBUG|INFO|WARNING|ERROR|CRITICAL) \S+ odoo\.</prematch>
+</decoder>
+
+<decoder name="ostral-odoo-1">
+  <parent>ostral-odoo</parent>
+  <prematch type="pcre2">Login (?:failed|successful) for db:</prematch>
+  <regex type="pcre2">Login (failed|successful) for db:(\S+) login:(\S+) from (\S+)</regex>
+  <order>odoo_login_result, odoo_db, dstuser, srcip</order>
+</decoder>
+
+<!-- ===================== Z4 — PostgreSQL ERP (lot C) ===================== -->
+<!-- log_line_prefix = '%m [%p] %q%u@%d from %h app=%a '
+     2026-10-19 10:00:00.123 CEST [42] odoo@ostral from 10.10.4.10 app=psql FATAL:  password authentication failed for user "odoo" -->
+<decoder name="ostral-pgsql">
+  <prematch type="pcre2">\[\d+\] (?:\S+@\S+ from \S+ app=\S* )?(?:LOG|FATAL|ERROR|WARNING|PANIC|STATEMENT|DETAIL|HINT):</prematch>
+</decoder>
+
+<decoder name="ostral-pgsql-auth">
+  <parent>ostral-pgsql</parent>
+  <prematch type="pcre2">FATAL:\s+(?:password authentication failed|no pg_hba\.conf entry)</prematch>
+  <regex type="pcre2">(\S+)@(\S+) from ([0-9A-Fa-f:.]+)\S* app=\S* FATAL:\s+(password authentication failed|no pg_hba\.conf entry)</regex>
+  <order>dstuser, pg_database, srcip, pg_error</order>
+</decoder>
+
+<decoder name="ostral-pgsql-ddl">
+  <parent>ostral-pgsql</parent>
+  <prematch type="pcre2">LOG:\s+statement:\s+(?i:CREATE|ALTER|DROP|GRANT|REVOKE|TRUNCATE)</prematch>
+  <regex type="pcre2">(\S+)@(\S+) from ([0-9A-Fa-f:.\[\]]+)\S* app=\S* LOG:\s+statement:\s+((?i:CREATE|ALTER|DROP|GRANT|REVOKE|TRUNCATE)\s+\S+(?:\s+\S+)?)</regex>
+  <order>dstuser, pg_database, srcip, pg_ddl</order>
+</decoder>
+
+<!-- ===================== Z5 — Samba AD (lot C) ===================== -->
+<!-- Lignes d'audit JSON de Samba (auth_json_audit, dsdb_json_audit, dsdb_group_json_audit) :
+     ... JSON Group Change: {"timestamp": ..., "type": "groupChange", "groupChange": {"action": "Added", ...}} -->
+<decoder name="ostral-samba">
+  <prematch type="pcre2">"type":\s*"(?:groupChange|Authentication|authorization|dsdbChange|passwordChange|dsdbTransaction)"</prematch>
+</decoder>
+
+<decoder name="ostral-samba-champs">
+  <parent>ostral-samba</parent>
+  <regex type="pcre2">"type":\s*"(\w+)"(?:.*?"remoteAddress":\s*"ipv4:([0-9.]+))?</regex>
+  <order>samba_event, srcip</order>
+</decoder>
+
+<!-- ===================== Z6/FW1 — WireGuard (lot D) : clé=valeur ===================== -->
+<!-- Les décodeurs enfants « -champs » portent le MÊME nom et n'ont pas de prematch : Wazuh les
+     enchaîne (chacun extrait un champ). Des enfants à prematch différents doivent, eux, avoir
+     des noms distincts (sinon erreur 2102 « Duplicated decoder with prematch »). -->
+<!-- 2026-10-19T10:00:00Z ostral-wireguard: event=connexion peer=admin1 ip=10.13.13.2 endpoint=203.0.113.5:51000 -->
+<!-- Pas de nom d'hôte dans la ligne : on ne dépend pas du pré-décodage syslog (program_name),
+     le parent reconnaît la paire event=... ; les règles filtrent en plus sur <location>. -->
+<decoder name="ostral-wireguard">
+  <prematch type="pcre2">(?:^|\s)event=\w+(?:\s|$)</prematch>
+</decoder>
+
+<decoder name="ostral-wireguard-champs">
+  <parent>ostral-wireguard</parent>
+  <regex type="pcre2">event=(\S+)(?:.*?\bpeer=(\S+))?(?:.*?\bendpoint=\[?(\d{1,3}(?:\.\d{1,3}){3})\]?:\d+)?</regex>
+  <order>wg_event, dstuser, srcip</order>
+</decoder>
+
+<!-- ===================== Z6 — Bastion Guacamole (lot D) ===================== -->
+<!-- 10:23:45.123 [http-nio-8080-exec-3] INFO  o.a.g.r.auth.AuthenticationService - User "admin1" successfully authenticated from 10.10.6.5.
+     10:23:45.123 [http-nio-8080-exec-3] WARN  o.a.g.r.auth.AuthenticationService - Authentication attempt from 10.10.6.5 for user "x" failed. -->
+<decoder name="ostral-guacamole">
+  <prematch type="pcre2">(?:o\.a\.g\.|org\.apache\.guacamole\.)\S*\s+- </prematch>
+</decoder>
+
+<decoder name="ostral-guacamole-1">
+  <parent>ostral-guacamole</parent>
+  <prematch type="pcre2">successfully authenticated from</prematch>
+  <regex type="pcre2">User "([^"]+)"(?: \(authenticated by "[^"]*"\))? successfully authenticated from \[?(\d{1,3}(?:\.\d{1,3}){3}|[0-9A-Fa-f:]+)</regex>
+  <order>dstuser, srcip</order>
+</decoder>
+
+<decoder name="ostral-guacamole-2">
+  <parent>ostral-guacamole</parent>
+  <prematch type="pcre2">Authentication attempt from</prematch>
+  <regex type="pcre2">Authentication attempt from \[?(\d{1,3}(?:\.\d{1,3}){3}|[0-9A-Fa-f:]+)[^\]"]*\]? for user "([^"]+)" failed</regex>
+  <order>srcip, dstuser</order>
+</decoder>

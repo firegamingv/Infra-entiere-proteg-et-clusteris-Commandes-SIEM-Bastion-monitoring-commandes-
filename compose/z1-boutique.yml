@@ -1,0 +1,179 @@
+# OSTRAL — Lot A : zone Z1 (cloud) — boutique, base managée, PSP/transporteur simulés.
+# Fragment fusionné avec docker-compose.yml via COMPOSE_FILE ; chemins relatifs à la racine du projet.
+# Réseaux déclarés dans docker-compose.yml (référencés ici sans redéclaration). Voir SPEC.md.
+#
+# Flux modélisés par l'appartenance réseau :
+#   F02 : waf (10.10.1.10) -> boutique:3000        réseau z1_cloud  (aucun port publié : pas d'adresse publique)
+#   F03 : boutique -> psp-mock:4000 (clé API)      réseau z1_egress
+#   F04 : boutique -> waf:9443 (mTLS)              réseau z1_cloud
+#   base : boutique -> boutique-db:5432            réseau z1_data   (seule la boutique y accède)
+#   E02 : navigateur client -> psp-mock (page de paiement hébergée), via z0_internet + port 4000
+
+services:
+  boutique:
+    build:
+      context: ./services/boutique
+    image: ostral/boutique:1.0.0
+    hostname: boutique
+    restart: unless-stopped
+    depends_on:
+      boutique-db:
+        condition: service_healthy
+    # Pas de depends_on sur waf (lot B) : le worker de l'outbox tolère l'absence de l'ERP (R2).
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      TRUSTED_PROXY: 10.10.1.10
+      BOUTIQUE_PUBLIC_URL: ${BOUTIQUE_PUBLIC_URL:-https://ostral.local}
+      LOG_FILE: /var/log/boutique/app.log
+      PGHOST: boutique-db
+      PGPORT: "5432"
+      PGDATABASE: boutique
+      PGUSER: boutique
+      BOUTIQUE_DB_PASSWORD: ${BOUTIQUE_DB_PASSWORD:?BOUTIQUE_DB_PASSWORD requis}
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET requis}
+      SESSION_TTL_MINUTES: ${SESSION_TTL_MINUTES:-120}
+      # E04 / SS2 : limitation des tentatives de connexion
+      LOGIN_WINDOW_MINUTES: ${LOGIN_WINDOW_MINUTES:-15}
+      LOGIN_MAX_PER_IP: ${LOGIN_MAX_PER_IP:-20}
+      LOGIN_MAX_PER_ACCOUNT: ${LOGIN_MAX_PER_ACCOUNT:-5}
+      LOGIN_LOCK_MINUTES: ${LOGIN_LOCK_MINUTES:-15}
+      # E02 / F03 : PSP et transporteur
+      PSP_API_URL: http://psp-mock:4000
+      PSP_PUBLIC_URL: ${PSP_PUBLIC_URL:-http://localhost:4000}
+      PSP_API_KEY: ${PSP_API_KEY:?PSP_API_KEY requis}
+      PSP_WEBHOOK_SECRET: ${PSP_WEBHOOK_SECRET:?PSP_WEBHOOK_SECRET requis}
+      PSP_NOTIFY_ALLOWED_IPS: 10.10.11.30
+      CARRIER_API_URL: http://psp-mock:4000
+      CARRIER_API_KEY: ${CARRIER_API_KEY:?CARRIER_API_KEY requis}
+      # F04 : API ERP via le WAF en mTLS
+      ERP_API_HOST: waf
+      ERP_API_PORT: "9443"
+      ERP_API_SERVERNAME: erp-api.ostral.internal
+      ODOO_DB: ${ODOO_DB:-ostral}
+      ODOO_API_USER: ${ODOO_API_USER:-api-boutique}
+      ODOO_API_KEY: ${ODOO_API_KEY:?ODOO_API_KEY requis}
+      OUTBOX_POLL_SECONDS: ${OUTBOX_POLL_SECONDS:-10}
+    volumes:
+      - logs_boutique:/var/log/boutique
+      # Certificats mTLS générés par scripts/gen-certs.sh (lot B) — lecture seule.
+      # create_host_path: false : échec explicite si les certificats n'ont pas été générés
+      # (évite que Docker crée des répertoires vides à la place des fichiers).
+      - type: bind
+        source: ./certs/ca.crt
+        target: /run/certs/ca.crt
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ./certs/boutique-client.crt
+        target: /run/certs/boutique-client.crt
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ./certs/boutique-client.key
+        target: /run/certs/boutique-client.key
+        read_only: true
+        bind: { create_host_path: false }
+    networks:
+      z1_cloud:
+        ipv4_address: 10.10.1.20
+      z1_data:
+        ipv4_address: 10.10.12.20
+      z1_egress:
+        ipv4_address: 10.10.11.20
+    # Durcissement E12
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 200
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+  boutique-db:
+    image: postgres:16.15-alpine3.24
+    hostname: boutique-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: boutique
+      POSTGRES_USER: boutique
+      POSTGRES_PASSWORD: ${BOUTIQUE_DB_PASSWORD:?BOUTIQUE_DB_PASSWORD requis}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - boutique_db_data:/var/lib/postgresql/data
+    networks:
+      z1_data:
+        ipv4_address: 10.10.12.30
+    # Durcissement E12 : utilisateur postgres (uid 70 de l'image alpine), FS racine en lecture seule
+    user: "70:70"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+      - /var/run/postgresql:rw,noexec,nosuid,size=1m,mode=1777
+    shm_size: 128m
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 200
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "boutique", "-d", "boutique"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  # PSP + transporteur simulés. Logiquement en Z0 (prestataires sur Internet) :
+  #  - z0_internet (10.10.0.40) + port publié 4000 : le navigateur du client atteint la page de
+  #    paiement hébergée (http://localhost:4000), sans passer par la boutique ni le WAF (E02, SAQ A) ;
+  #  - z1_egress (10.10.11.30) : appels API de la boutique (F03) et notification signée vers la boutique.
+  psp-mock:
+    build:
+      context: ./services/psp-mock
+    image: ostral/psp-mock:1.0.0
+    hostname: psp-mock
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "4000"
+      PSP_PUBLIC_URL: ${PSP_PUBLIC_URL:-http://localhost:4000}
+      PSP_API_KEY: ${PSP_API_KEY:?PSP_API_KEY requis}
+      PSP_WEBHOOK_SECRET: ${PSP_WEBHOOK_SECRET:?PSP_WEBHOOK_SECRET requis}
+      CARRIER_API_KEY: ${CARRIER_API_KEY:?CARRIER_API_KEY requis}
+      MERCHANT_PUBLIC_URL: ${BOUTIQUE_PUBLIC_URL:-https://ostral.local}
+      MERCHANT_NOTIFY_URL: http://boutique:3000/payment/notify
+    ports:
+      # Lié à l'hôte local uniquement (le navigateur de démonstration tourne sur l'hôte)
+      - "127.0.0.1:4000:4000"
+    networks:
+      z0_internet:
+        ipv4_address: 10.10.0.40
+      z1_egress:
+        ipv4_address: 10.10.11.30
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 100
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  logs_boutique:      # journaux JSON de la boutique, lus par Wazuh (E08)
+  boutique_db_data:   # données de la base boutique

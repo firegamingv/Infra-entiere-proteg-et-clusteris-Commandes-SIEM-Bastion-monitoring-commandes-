@@ -1,0 +1,470 @@
+{
+  "version": "1.23.17",
+  "notificationList": [],
+  "proxyList": [],
+  "monitorList": [
+    {
+      "description": "E11 : https://ostral.local:8443/ via le WAF (10.10.0.10, z0_internet). Toutes les 60 s, alerte (SMS astreinte) apres 2 echecs consecutifs.",
+      "method": "GET",
+      "body": null,
+      "headers": null,
+      "authMethod": null,
+      "basic_auth_user": null,
+      "basic_auth_pass": null,
+      "authWorkstation": null,
+      "authDomain": null,
+      "resendInterval": 30,
+      "hostname": null,
+      "port": null,
+      "keyword": null,
+      "invertKeyword": false,
+      "ignoreTls": false,
+      "upsideDown": false,
+      "maxredirects": 10,
+      "accepted_statuscodes": [
+        "200-299"
+      ],
+      "dns_resolve_type": "A",
+      "dns_resolve_server": "1.1.1.1",
+      "notificationIDList": {},
+      "proxy_id": null,
+      "active": 1,
+      "url": "https://ostral.local:8443/",
+      "tags": [
+        {
+          "name": "E11",
+          "color": "#DC2626",
+          "value": ""
+        }
+      ],
+      "id": 1,
+      "name": "Boutique vue d'Internet (sonde externe)",
+      "type": "http",
+      "interval": 60,
+      "retryInterval": 60,
+      "maxretries": 1,
+      "timeout": 10
+    },
+    {
+      "description": "Seuil p. 12 : delai d'attente 2 s, 5 echecs consecutifs (5 x 60 s) avant alerte (e-mail).",
+      "method": "GET",
+      "body": null,
+      "headers": null,
+      "authMethod": null,
+      "basic_auth_user": null,
+      "basic_auth_pass": null,
+      "authWorkstation": null,
+      "authDomain": null,
+      "resendInterval": 0,
+      "hostname": null,
+      "port": null,
+      "keyword": null,
+      "invertKeyword": false,
+      "ignoreTls": false,
+      "upsideDown": false,
+      "maxredirects": 10,
+      "accepted_statuscodes": [
+        "200-299"
+      ],
+      "dns_resolve_type": "A",
+      "dns_resolve_server": "1.1.1.1",
+      "notificationIDList": {},
+      "proxy_id": null,
+      "active": 1,
+      "url": "https://ostral.local:8443/",
+      "tags": [
+        {
+          "name": "E11",
+          "color": "#DC2626",
+          "value": ""
+        }
+      ],
+      "id": 2,
+      "name": "Boutique - temps de reponse > 2 s pendant 5 min",
+      "type": "http",
+      "interval": 60,
+      "retryInterval": 60,
+      "maxretries": 4,
+      "timeout": 2
+    },
+    {
+      "description": "Z3 : http://odoo:8069/web/health (z3_servers), reponse attendue contenant \"pass\".",
+      "method": "GET",
+      "body": null,
+      "headers": null,
+      "authMethod": null,
+      "basic_auth_user": null,
+      "basic_auth_pass": null,
+      "authWorkstation": null,
+      "authDomain": null,
+      "resendInterval": 0,
+      "hostname": null,
+      "port": null,
+      "keyword": "pass",
+      "invertKeyword": false,
+      "ignoreTls": false,
+      "upsideDown": false,
+      "maxredirects": 10,
+      "accepted_statuscodes": [
+        "200-299"
+      ],
+      "dns_resolve_type": "A",
+      "dns_resolve_server": "1.1.1.1",
+      "notificationIDList": {},
+      "proxy_id": null,
+      "active": 1,
+      "url": "http://odoo:8069/web/health",
+      "tags": [
+        {
+          "name": "F18",
+          "color": "#2563EB",
+          "value": ""
+        }
+      ],
+      "id": 3,
+      "name": "ERP Odoo - /web/health",
+      "type": "keyword",
+      "interval": 60,
+      "retryInterval": 60,
+      "maxretries": 2,
+      "timeout": 10
+    },
+    {
+      "description": "F01 : point d'entrée unique du site, vu depuis Z0. (Le port mTLS 9443 n'écoute que côté cloud, 10.10.1.10.)",
+      "method": "GET",
+      "body": null,
+      "headers": null,
+      "authMethod": null,
+      "basic_auth_user": null,
+      "basic_auth_pass": null,
+      "authWorkstation": null,
+      "authDomain": null,
+      "resendInterval": 0,
+      "hostname": "10.10.0.10",
+      "port": 8443,
+      "keyword": null,
+      "invertKeyword": false,
+      "ignoreTls": false,
+      "upsideDown": false,
+      "maxredirects": 10,
+      "accepted_statuscodes": [
+        "200-299"
+      ],
+      "dns_resolve_type": "A",
+      "dns_resolve_server": "1.1.1.1",
+      "notificationIDList": {},
+      "proxy_id": null,
+      "active": 1,
+      "url": "https://",
+      "tags": [
+        {
+          "name": "F18",
+          "color": "#2563EB",
+          "value": ""
+        }
+      ],
+      "id": 4,
+      "name": "WAF - entrée publique HTTPS (TCP 8443)",
+      "type": "port",
+      "interval": 60,
+      "retryInterval": 60,
+      "maxretries": 2,
+      "timeout": 10
+    },
+    {
+      "description": "Z3 : serveur cible du bastion et de la sauvegarde pull (F10, F16).",
+      "method": "GET",
+      "body": null,
+      "headers": null,
+      "authMethod": null,
+      "basic_auth_user": null,
+      "basic_auth_pass": null,
+      "authWorkstation": null,
+      "authDomain": null,
+      "resendInterval": 0,
+      "hostname": "10.10.3.30",
+      "port": 22,
+      "keyword": null,
+      "invertKeyword": false,
+      "ignoreTls": false,
+      "upsideDown": false,
+      "maxredirects": 10,
+      "accepted_statuscodes": [
+        "200-299"
+      ],
+      "dns_resolve_type": "A",
+      "dns_resolve_server": "1.1.1.1",
+      "notificationIDList": {},
+      "proxy_id": null,
+      "active": 1,
+      "url": "https://",
+      "tags": [
+        {
+          "name": "F18",
+          "color": "#2563EB",
+          "value": ""
+        }
+      ],
+      "id": 5,
+      "name": "admin-target - SSH (TCP 22)",
+      "type": "port",
+      "interval": 120,
+      "retryInterval": 60,
+      "maxretries": 2,
+      "timeout": 10
+    },
+    {
+      "description": "E06 : bastion d'administration (Z6), vu depuis Z7 (F18).",
+      "method": "GET",
+      "body": null,
+      "headers": null,
+      "authMethod": null,
+      "basic_auth_user": null,
+      "basic_auth_pass": null,
+      "authWorkstation": null,
+      "authDomain": null,
+      "resendInterval": 0,
+      "hostname": "10.10.6.10",
+      "port": 8080,
+      "keyword": null,
+      "invertKeyword": false,
+      "ignoreTls": false,
+      "upsideDown": false,
+      "maxredirects": 10,
+      "accepted_statuscodes": [
+        "200-299"
+      ],
+      "dns_resolve_type": "A",
+      "dns_resolve_server": "1.1.1.1",
+      "notificationIDList": {},
+      "proxy_id": null,
+      "active": 1,
+      "url": "https://",
+      "tags": [
+        {
+          "name": "F18",
+          "color": "#2563EB",
+          "value": ""
+        }
+      ],
+      "id": 6,
+      "name": "Bastion - Guacamole web (TCP 8080)",
+      "type": "port",
+      "interval": 120,
+      "retryInterval": 60,
+      "maxretries": 2,
+      "timeout": 10
+    },
+    {
+      "description": "FW1/VPN : 10.10.7.5 (l'UDP 51820 ne se teste pas en TCP).",
+      "method": "GET",
+      "body": null,
+      "headers": null,
+      "authMethod": null,
+      "basic_auth_user": null,
+      "basic_auth_pass": null,
+      "authWorkstation": null,
+      "authDomain": null,
+      "resendInterval": 0,
+      "hostname": "10.10.7.5",
+      "port": null,
+      "keyword": null,
+      "invertKeyword": false,
+      "ignoreTls": false,
+      "upsideDown": false,
+      "maxredirects": 10,
+      "accepted_statuscodes": [
+        "200-299"
+      ],
+      "dns_resolve_type": "A",
+      "dns_resolve_server": "1.1.1.1",
+      "notificationIDList": {},
+      "proxy_id": null,
+      "active": 1,
+      "url": "https://",
+      "tags": [
+        {
+          "name": "F18",
+          "color": "#2563EB",
+          "value": ""
+        }
+      ],
+      "id": 7,
+      "name": "VPN WireGuard - interface Z7 (ping)",
+      "type": "ping",
+      "interval": 120,
+      "retryInterval": 60,
+      "maxretries": 2,
+      "timeout": 10
+    },
+    {
+      "description": "Profil siem. F11 : reception des agents.",
+      "method": "GET",
+      "body": null,
+      "headers": null,
+      "authMethod": null,
+      "basic_auth_user": null,
+      "basic_auth_pass": null,
+      "authWorkstation": null,
+      "authDomain": null,
+      "resendInterval": 0,
+      "hostname": "10.10.7.20",
+      "port": 1514,
+      "keyword": null,
+      "invertKeyword": false,
+      "ignoreTls": false,
+      "upsideDown": false,
+      "maxredirects": 10,
+      "accepted_statuscodes": [
+        "200-299"
+      ],
+      "dns_resolve_type": "A",
+      "dns_resolve_server": "1.1.1.1",
+      "notificationIDList": {},
+      "proxy_id": null,
+      "active": 1,
+      "url": "https://",
+      "tags": [
+        {
+          "name": "F18",
+          "color": "#2563EB",
+          "value": ""
+        }
+      ],
+      "id": 8,
+      "name": "SIEM - Wazuh manager agents (TCP 1514)",
+      "type": "port",
+      "interval": 120,
+      "retryInterval": 60,
+      "maxretries": 2,
+      "timeout": 10
+    },
+    {
+      "description": "Profil siem. Console du SIEM (AC interne Wazuh : verification TLS desactivee pour cette sonde).",
+      "method": "GET",
+      "body": null,
+      "headers": null,
+      "authMethod": null,
+      "basic_auth_user": null,
+      "basic_auth_pass": null,
+      "authWorkstation": null,
+      "authDomain": null,
+      "resendInterval": 0,
+      "hostname": null,
+      "port": null,
+      "keyword": null,
+      "invertKeyword": false,
+      "ignoreTls": true,
+      "upsideDown": false,
+      "maxredirects": 10,
+      "accepted_statuscodes": [
+        "200-399",
+        "401"
+      ],
+      "dns_resolve_type": "A",
+      "dns_resolve_server": "1.1.1.1",
+      "notificationIDList": {},
+      "proxy_id": null,
+      "active": 1,
+      "url": "https://10.10.7.22:5601/",
+      "tags": [
+        {
+          "name": "F18",
+          "color": "#2563EB",
+          "value": ""
+        }
+      ],
+      "id": 9,
+      "name": "SIEM - Wazuh dashboard (HTTPS 5601)",
+      "type": "http",
+      "interval": 120,
+      "retryInterval": 60,
+      "maxretries": 2,
+      "timeout": 10
+    },
+    {
+      "description": "E09 : le service backup pousse un battement apres chaque sauvegarde horaire reussie ; absence > 65 min ou echec => alerte (e-mail + ticket).",
+      "method": "GET",
+      "body": null,
+      "headers": null,
+      "authMethod": null,
+      "basic_auth_user": null,
+      "basic_auth_pass": null,
+      "authWorkstation": null,
+      "authDomain": null,
+      "resendInterval": 0,
+      "hostname": null,
+      "port": null,
+      "keyword": null,
+      "invertKeyword": false,
+      "ignoreTls": false,
+      "upsideDown": false,
+      "maxredirects": 10,
+      "accepted_statuscodes": [
+        "200-299"
+      ],
+      "dns_resolve_type": "A",
+      "dns_resolve_server": "1.1.1.1",
+      "notificationIDList": {},
+      "proxy_id": null,
+      "active": 1,
+      "url": "https://",
+      "tags": [
+        {
+          "name": "E09",
+          "color": "#059669",
+          "value": ""
+        }
+      ],
+      "id": 10,
+      "name": "Sauvegarde horaire ERP (push)",
+      "type": "push",
+      "pushToken": "OstralBackupHourly01",
+      "interval": 3900,
+      "retryInterval": 300,
+      "maxretries": 0
+    },
+    {
+      "description": "E09 / seuil p. 12 : sauvegarde nocturne en echec ou absente (25 h) => e-mail + ticket.",
+      "method": "GET",
+      "body": null,
+      "headers": null,
+      "authMethod": null,
+      "basic_auth_user": null,
+      "basic_auth_pass": null,
+      "authWorkstation": null,
+      "authDomain": null,
+      "resendInterval": 0,
+      "hostname": null,
+      "port": null,
+      "keyword": null,
+      "invertKeyword": false,
+      "ignoreTls": false,
+      "upsideDown": false,
+      "maxredirects": 10,
+      "accepted_statuscodes": [
+        "200-299"
+      ],
+      "dns_resolve_type": "A",
+      "dns_resolve_server": "1.1.1.1",
+      "notificationIDList": {},
+      "proxy_id": null,
+      "active": 1,
+      "url": "https://",
+      "tags": [
+        {
+          "name": "E09",
+          "color": "#059669",
+          "value": ""
+        }
+      ],
+      "id": 11,
+      "name": "Sauvegarde nocturne (push)",
+      "type": "push",
+      "pushToken": "OstralBackupNightly01",
+      "interval": 90000,
+      "retryInterval": 600,
+      "maxretries": 0
+    }
+  ]
+}
