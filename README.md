@@ -1,6 +1,6 @@
 # OSTRAL — maquette de l'architecture sécurisée
 
-Projet M2 Cybersécurité EFREI 2026 : mise en œuvre, sous Docker Compose, de l'architecture cible
+ mise en œuvre, sous Docker Compose, de l'architecture cible
 définie dans le dossier « OSTRAL — Ateliers 1 à 3 » (PME fictive de mobilier en ligne).
 
 La maquette reproduit les 9 zones Z0 à Z8, la matrice de flux F01 à F18 et les exigences E01 à E12.
